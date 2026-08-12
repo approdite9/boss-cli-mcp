@@ -36,7 +36,8 @@
   "main": "dist/cli/index.js",
   "types": "dist/cli/index.d.ts",
   "bin": {
-    "boss": "dist/cli/index.js"
+    "boss": "dist/cli/index.js",
+    "boss-mcp": "dist/mcp/server.js"
   },
   "files": [
     "dist",
@@ -47,11 +48,17 @@
   ],
   "scripts": {
     "build": "tsc",
+    "prepare": "npm run build",
     "dev": "npm run build && node dist/cli/index.js",
+    "mcp": "npm run build && node dist/mcp/server.js",
     "deploy": "node scripts/deploy.mjs",
     "test:baidu": "node --env-file=.env scripts/test-baidu-ocr.mjs"
   },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "dotenv": "^17.4.2",
     "puppeteer-core": "^24.29.1"
   },
