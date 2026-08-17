@@ -5,3 +5,10 @@ dist/
 *.log
 .browser-profile/
 .boss-sessions/
+
+# 本地实验/凭证/产物，禁止入库
+_ssh.mjs
+_retired/
+*.tgz
+*.tar.gz
+.tmp-*

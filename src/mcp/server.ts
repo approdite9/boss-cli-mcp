@@ -21,6 +21,17 @@ import { detachBrowserSession } from '../browser/index.js';
 import { getPackageMeta } from '../cli/version.js';
 import { runToolCall, textResult, type ToolContext } from './dispatch.js';
 import { formatEnvLoadReport, loadMcpEnv } from './env.js';
+import {
+  assertDebugPortBrowserIsHeadful,
+  assertHeadfulRuntime,
+  createBrowserCallThrottle,
+  formatCallGapNotice,
+  formatProfileNotice,
+  inspectBrowserProfile,
+  parseCallGapMs,
+  probeDebugPortBrowser,
+  REMOTE_DEBUGGING_PORT,
+} from './local_guard.js';
 import { assertResumeOcrReady } from './preflight.js';
 import {
   enhanceToolErrorMessage,
@@ -75,23 +86,23 @@ console.warn = (...args: unknown[]) => console.error(...args);
 // 加载报告在 server 启动日志里输出（stderr），便于排查“配了却不生效”。
 const envReport = loadMcpEnv(APP_HOME);
 
-function envTruthy(name: string): boolean {
-  const v = (process.env[name] ?? '').trim().toLowerCase();
-  return v === '1' || v === 'true' || v === 'yes' || v === 'y';
+// 有头约束必须在**任何**浏览器动作之前校验，且要在 .env 加载之后（.env 里也可能设置它）。
+// 这里显式 exit(1) 而不是任其抛出：本文件后面注册的 uncaughtException 处理器会吞掉异常，
+// 而无头运行属于必须让进程起不来的配置错误，不能被「server 继续运行」兜过去。
+try {
+  assertHeadfulRuntime();
+} catch (e) {
+  console.error(e instanceof Error ? e.message : String(e));
+  process.exit(1);
 }
 
 /**
- * 进程启动时的无头偏好。`implLogin` 会把 `BOSS_BROWSER_HEADLESS` 强制改成 `false`
- * （登录必须可见），长驻进程里必须在每次调用前按原始偏好复位，否则登录一次就永久变成有头。
+ * 有头运行是硬约束（原因见 `local_guard.ts`：页面守卫的成立前提就是「真实机器 + 有头浏览器」），
+ * 启动时已由 {@link assertHeadfulRuntime} 校验过。这里在每次调用前把开关钉回 `false`，
+ * 确保长驻进程中没有任何路径能把它改成无头——原先 SSE 分支就是从这里退化成 headless 登录的。
  */
-const HEADLESS_PREFERENCE = envTruthy('BOSS_BROWSER_HEADLESS');
-
-function configureHeadlessForTool(toolName: string): void {
-  if (toolName === 'boss_login') {
-    process.env.BOSS_BROWSER_HEADLESS = 'false';
-    return;
-  }
-  process.env.BOSS_BROWSER_HEADLESS = HEADLESS_PREFERENCE ? 'true' : 'false';
+function configureHeadlessForTool(_toolName: string): void {
+  process.env.BOSS_BROWSER_HEADLESS = 'false';
 }
 
 /**
@@ -115,6 +126,16 @@ const HEARTBEAT_INTERVAL_MS = (() => {
   if (!Number.isFinite(n) || n < 1_000) return 10_000;
   return n;
 })();
+
+/**
+ * 相邻浏览器类调用之间的随机间隔。CLI 下人敲命令天然有停顿，MCP 下 Agent 会零停顿连发；
+ * 串行队列只保证不并发，不保证间隔。可用 `BOSS_MCP_CALL_GAP_MS` 覆盖（`"1800-5000"` / `"2500"` / `"0"`）。
+ */
+const { gap: CALL_GAP_MS, invalidInput: callGapInvalidInput } = parseCallGapMs(
+  process.env.BOSS_MCP_CALL_GAP_MS,
+);
+
+const browserCallThrottle = createBrowserCallThrottle({ gapMs: CALL_GAP_MS });
 
 // ── 串行队列 ──────────────────────────────────────────────────
 // 同一只浏览器并发操作会互相抢页面焦点；且 `withBossSessionLock` 是**跨进程文件锁**，
@@ -980,9 +1001,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra): Promise<
       pendingCount: () => queueDepth,
       // 把共享层那条英文会话锁超时错误改写成可操作指引
       mapErrorMessage: enhanceToolErrorMessage,
-      execute: (ctx) => {
+      execute: async (ctx) => {
         configureHeadlessForTool(toolName);
-        return spec.run(args, ctx);
+        // 环境变量钉成 false 只管「新 spawn」；`connectBrowser` 的复用分支不看它，
+        // 所以每次调用都要确认调试端口上那只不是无头的（本地 HTTP，~ms 级）。
+        await assertDebugPortBrowserIsHeadful(REMOTE_DEBUGGING_PORT);
+        // 节流必须在串行队列内部、且在任何页面动作之前：放到队列外会让多个调用的间隔互相重叠而失效。
+        const waited = await browserCallThrottle.beforeCall(toolName, ctx.signal);
+        if (waited > 0) {
+          ctx.tick(`${toolName} 按人类节奏等待 ${waited}ms 后开始`);
+        }
+        try {
+          return await spec.run(args, ctx);
+        } finally {
+          browserCallThrottle.afterCall(toolName);
+        }
       },
     }),
   );
@@ -1026,12 +1059,32 @@ await server.connect(transport);
 
 console.error(
   [
-    `[boss-mcp] ${pkgName} ${pkgVersion} MCP server 已启动（stdio），共 ${TOOLS.length} 个工具`,
+    `[boss-mcp] ${pkgName} ${pkgVersion} MCP server 已启动（stdio，有头浏览器），共 ${TOOLS.length} 个工具`,
     `单次调用看门狗 ${TOOL_TIMEOUT_MS === 0 ? '已关闭' : `${TOOL_TIMEOUT_MS}ms`}`,
     `心跳 ${HEARTBEAT_INTERVAL_MS}ms`,
   ].join('，'),
 );
 console.error(formatEnvLoadReport(envReport));
+console.error(formatCallGapNotice(CALL_GAP_MS, callGapInvalidInput));
+console.error(formatProfileNotice(inspectBrowserProfile()));
+
+// 启动时报一次调试端口现状：把「端口上占着一只陈旧无头 Chrome」这种情况提前暴露，
+// 而不是等第一次工具调用才报错。真正的强制拦截在每次调用的 execute 里。
+{
+  const probe = await probeDebugPortBrowser(REMOTE_DEBUGGING_PORT);
+  if (!probe.reachable) {
+    console.error(
+      `[boss-mcp] 调试端口 ${REMOTE_DEBUGGING_PORT} 当前无浏览器：首次工具调用会自动拉起一只**有头** Chrome。`,
+    );
+  } else if (probe.headless) {
+    console.error(
+      `[boss-mcp] ⚠️ 调试端口 ${REMOTE_DEBUGGING_PORT} 上是**无头** Chrome（${probe.userAgent}）。`,
+    );
+    console.error('[boss-mcp]   工具调用会被拒绝，直到它被清理掉。清理命令见调用时的报错信息。');
+  } else {
+    console.error(`[boss-mcp] 调试端口 ${REMOTE_DEBUGGING_PORT} 上是有头 Chrome，可复用。`);
+  }
+}
 
 // 多实例告警：把「稍后莫名 30s session is busy」提前暴露成启动时的一条明确告警
 const { conflict } = registerInstance();

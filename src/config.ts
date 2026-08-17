@@ -17,7 +17,7 @@ export function getAgentSkillsDir(): string {
 }
 
 /** 应用主目录（业务数据在 .cache 下） */
-export const APP_HOME = join(homedir(), '.boss-cli');
+export const APP_HOME = process.env.BOSS_APP_HOME?.trim() || join(homedir(), '.boss-cli');
 
 /** 存放岗位 JD 的目录（每个岗位一个 .md 文件） */
 export const JD_DIR = join(APP_HOME, 'jd');
