@@ -71,6 +71,48 @@ export function assertHeadfulRuntime(
 }
 
 /**
+ * Linux 上「有头」还有一个前置条件：必须有可用的显示服务。
+ * 没有 DISPLAY / WAYLAND_DISPLAY 时，不带 `--headless` 的 Chrome 会直接启动失败，
+ * 报错信息落在 Chrome 的 stderr 里、非常晦涩（往往只是「进程在就绪前退出」）。
+ * 这里提前拦住并说清原因。
+ *
+ * 注意：Xvfb 会设置 DISPLAY，因此能通过本检查——但虚拟显示只解决「能不能起来」，
+ * 不解决指纹问题（无 GPU → SwiftShader、无中文字体、无真实交互事件）。详见文件头注释。
+ */
+export function assertUsableDisplay(
+  env: { DISPLAY?: string; WAYLAND_DISPLAY?: string } = process.env,
+  platform: string = process.platform,
+): void {
+  if (platform !== 'linux') {
+    return;
+  }
+  const hasDisplay = (env.DISPLAY ?? '').trim().length > 0;
+  const hasWayland = (env.WAYLAND_DISPLAY ?? '').trim().length > 0;
+  if (hasDisplay || hasWayland) {
+    return;
+  }
+  throw new Error(
+    [
+      '[boss-mcp] ❌ 拒绝启动：Linux 上未检测到 DISPLAY / WAYLAND_DISPLAY。',
+      '',
+      'boss-mcp 强制有头运行，而没有显示服务时 Chrome 无法以有头模式启动',
+      '（表现通常是「浏览器进程在就绪前退出」，看不出真实原因）。',
+      '',
+      '如果这是一台桌面机：请在图形会话内启动 MCP 客户端，而不是通过纯 SSH。',
+      '',
+      '如果这是一台无图形界面的服务器：请重新考虑部署位置。',
+      '  用 Xvfb 造一个虚拟显示能让进程起来，但解决不了这些特征：',
+      '    - 无 GPU → WebGL renderer 变成 SwiftShader / llvmpipe',
+      '    - 服务器通常无中文字体 → 中文站点上 measureText 指纹极其独特',
+      '    - 无真实鼠标/键盘事件历史',
+      '  再叠加机房 IP 与全新 profile（= 异地新设备登录），这正是账号被封的典型组合。',
+      '  推荐做法：boss-mcp 跑在你日常使用的桌面机上，把 stdio MCP 通过内网穿透 / VPN',
+      '  暴露给远程的 Agent 客户端，而不是把浏览器搬到服务器。',
+    ].join('\n'),
+  );
+}
+
+/**
  * 只查环境变量是不够的——`connectBrowser()` 有一条**复用**分支：
  * 探测 `127.0.0.1:<port>/json/version` 命中就直接 `puppeteer.connect()`，
  * 此时 `BOSS_BROWSER_HEADLESS` 完全不参与决策。如果那个端口上占着的是一只**陈旧的无头 Chrome**
@@ -113,7 +155,28 @@ export async function probeDebugPortBrowser(
   }
 }
 
-export function formatStaleHeadlessMessage(port: number, userAgent: string): string {
+/** 清理残留无头浏览器的命令，按平台给出——给 Linux 用户一段 PowerShell 等于没给。 */
+function killHeadlessHint(platform: string = process.platform): string[] {
+  if (platform === 'win32') {
+    return [
+      '清理（PowerShell）：',
+      '  Get-CimInstance Win32_Process -Filter "Name=\'chrome.exe\'" |',
+      '    Where-Object { $_.CommandLine -like \'*--headless*\' } |',
+      '    ForEach-Object { Stop-Process -Id $_.ProcessId -Force }',
+    ];
+  }
+  return [
+    '清理（shell）：',
+    '  pkill -f "chrome.*--headless"',
+    '  # 先确认要杀哪些： pgrep -af "chrome.*--headless"',
+  ];
+}
+
+export function formatStaleHeadlessMessage(
+  port: number,
+  userAgent: string,
+  platform: string = process.platform,
+): string {
   return [
     `❌ 拒绝执行：调试端口 ${port} 上占着一只**无头** Chrome，复用它会绕过有头约束。`,
     `   检测到的 User-Agent：${userAgent}`,
@@ -121,10 +184,7 @@ export function formatStaleHeadlessMessage(port: number, userAgent: string): str
     '来源通常是早先的无头运行没退干净。boss-cli 的复用逻辑只探测端口是否可达，',
     '不校验对端是否有头，所以必须在这里拦下来。',
     '',
-    '清理（PowerShell）：',
-    '  Get-CimInstance Win32_Process -Filter "Name=\'chrome.exe\'" |',
-    '    Where-Object { $_.CommandLine -like \'*--headless*\' } |',
-    '    ForEach-Object { Stop-Process -Id $_.ProcessId -Force }',
+    ...killHeadlessHint(platform),
     '',
     '清理后重新调用即可——boss-cli 会从同一个 profile 重新拉起一只有头 Chrome，登录态不丢。',
   ].join('\n');

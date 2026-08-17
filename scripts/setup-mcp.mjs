@@ -472,7 +472,14 @@ function printJson(tarball, options = {}) {
   console.log('若客户端里已有其它 server，只把 "boss" 这一项合并进现有的 mcpServers 对象即可。');
   console.log('');
   console.log('要点：');
-  console.log('  · 用 command:"node" + 绝对路径，绕开 Windows 上 npm 全局 bin 的 .cmd/.ps1 shim 问题');
+  console.log(
+    process.platform === 'win32'
+      ? '  · 用 command:"node" + 绝对路径，绕开 Windows 上 npm 全局 bin 的 .cmd/.ps1 shim 问题'
+      : '  · 用 command:"node" + 绝对路径，不依赖 PATH 里是否有 boss-mcp',
+  );
+  if (process.platform === 'linux') {
+    console.log('  · Linux 必须在图形会话内启动客户端：无 DISPLAY 时 server 会拒绝启动（有头是硬约束）');
+  }
   if (Object.keys(embedded).length > 0) {
     console.log('  · 密钥已内联：目标机器无需 ~/.boss-cli/.env，粘这一份即可用');
     console.log('  · 客户端 env 的优先级高于 ~/.boss-cli/.env（进程启动时就在环境里，dotenv 不覆盖已有值）');

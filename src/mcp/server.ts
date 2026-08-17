@@ -24,6 +24,7 @@ import { formatEnvLoadReport, loadMcpEnv } from './env.js';
 import {
   assertDebugPortBrowserIsHeadful,
   assertHeadfulRuntime,
+  assertUsableDisplay,
   createBrowserCallThrottle,
   formatCallGapNotice,
   formatProfileNotice,
@@ -91,6 +92,8 @@ const envReport = loadMcpEnv(APP_HOME);
 // 而无头运行属于必须让进程起不来的配置错误，不能被「server 继续运行」兜过去。
 try {
   assertHeadfulRuntime();
+  // Linux 上有头还需要显示服务；无 DISPLAY 时 Chrome 起不来，提前说清原因而不是等它晦涩地失败
+  assertUsableDisplay();
 } catch (e) {
   console.error(e instanceof Error ? e.message : String(e));
   process.exit(1);
