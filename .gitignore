@@ -12,3 +12,8 @@ _retired/
 *.tgz
 *.tar.gz
 .tmp-*
+
+# CloakBrowser 集成
+.env.cloakbrowser
+test_*.mjs
+boss-cli-main/

@@ -63,6 +63,9 @@
     "dotenv": "^17.4.2",
     "puppeteer-core": "^24.29.1"
   },
+  "optionalDependencies": {
+    "cloakbrowser": "^0.5.7"
+  },
   "devDependencies": {
     "@types/node": "^24.10.0",
     "ssh2": "^1.17.0",

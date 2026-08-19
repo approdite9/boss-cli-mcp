@@ -1,5 +1,5 @@
 import type { Frame, Page } from 'puppeteer-core';
-import { RESUME_PREVIEW_OPEN_GAP_MS, sleepRandom } from '../browser/index.js';
+import { RESUME_PREVIEW_OPEN_GAP_MS, sleepRandom, typeChineseWithIME } from '../browser/index.js';
 import { withBossSessionPage } from '../common/boss_session_page.js';
 import { ensurePage } from '../common/ensure_page.js';
 
@@ -95,36 +95,26 @@ export async function assertNormalSearchPageReadyForPreview(page: Page): Promise
 }
 
 async function runKeywordSearch(frame: Frame, keyword: string): Promise<void> {
-  const kwLiteral = JSON.stringify(keyword);
+  // 聚焦搜索输入框
   const ok = (await frame.evaluate(`(() => {
     const input = document.querySelector(".search-input");
     if (!(input instanceof HTMLInputElement)) return false;
-    const kw = ${kwLiteral};
     input.focus();
-    input.value = kw;
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-    input.dispatchEvent(new Event("change", { bubbles: true }));
-    input.dispatchEvent(new KeyboardEvent("keydown", {
-      key: "Enter",
-      code: "Enter",
-      keyCode: 13,
-      which: 13,
-      bubbles: true,
-      cancelable: true,
-    }));
-    input.dispatchEvent(new KeyboardEvent("keyup", {
-      key: "Enter",
-      code: "Enter",
-      keyCode: 13,
-      which: 13,
-      bubbles: true,
-      cancelable: true,
-    }));
+    input.select();
     return true;
   })()`)) as boolean;
   if (!ok) {
     throw new Error('未找到常规搜索关键词输入框（.search-input）。');
   }
+
+  // 用 IME 事件流输入关键词（frame 内的 page 可用 typeChineseWithIME）
+  const framePage = frame.page();
+  await sleepRandom(80, 200);
+  await typeChineseWithIME(framePage, keyword);
+  await sleepRandom(100, 250);
+
+  // 回车触发搜索
+  await framePage.keyboard.press('Enter');
 
   await frame.waitForFunction(
     `((kw) => {

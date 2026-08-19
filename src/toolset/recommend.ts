@@ -4,6 +4,7 @@ import {
   JOB_SELECT_ACTION_GAP_MS,
   RESUME_PREVIEW_OPEN_GAP_MS,
   sleepRandom,
+  humanClickSelector,
 } from '../browser/index.js';
 import { withBossSessionPage } from '../common/boss_session_page.js';
 import { ensurePage } from '../common/ensure_page.js';
@@ -393,16 +394,16 @@ export async function clickGreet(
       if (disabled) {
         return { kind: "disabled", name };
       }
-      btn.scrollIntoView({ block: "center", inline: "nearest" });
-      btn.click();
-      return { kind: "clicked", name, geekId };
+      // 标记按钮供外部 humanClickSelector 定位
+      btn.setAttribute("data-boss-greet-target", "1");
+      return { kind: "ready_to_click", name, geekId };
     })()`,
   )) as
     | { kind: 'empty' }
     | { kind: 'not_found'; target: string }
     | { kind: 'no_btn'; name: string }
     | { kind: 'disabled'; name: string }
-    | { kind: 'clicked'; name: string; geekId: string };
+    | { kind: 'ready_to_click'; name: string; geekId: string };
 
   switch (result.kind) {
     case 'empty':
@@ -413,7 +414,15 @@ export async function clickGreet(
       throw new Error(`候选人 ${result.name} 缺少“打招呼”按钮，无法执行。`);
     case 'disabled':
       throw new Error(`候选人 ${result.name} 已打招呼。`);
-    case 'clicked':
+    case 'ready_to_click':
+      // 用贝塞尔曲线鼠标移动 + 拟人点击
+      const greetPage = frame.page();
+      await humanClickSelector(greetPage, '[data-boss-greet-target="1"]');
+      // 清除标记
+      await frame.evaluate(() => {
+        const el = document.querySelector('[data-boss-greet-target="1"]');
+        el?.removeAttribute('data-boss-greet-target');
+      });
       return {
         message: `已对 ${result.name} 点击“打招呼”。`,
       };

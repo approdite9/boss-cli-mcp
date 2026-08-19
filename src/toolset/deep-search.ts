@@ -6,6 +6,9 @@ import {
   RESUME_PREVIEW_OPEN_GAP_MS,
   selectAllModifierKey,
   sleepRandom,
+  typeChineseWithIME,
+  humanClickSelector,
+  humanMouseMove,
 } from '../browser/index.js';
 import { withBossSessionPage } from '../common/boss_session_page.js';
 import { ensurePage } from '../common/ensure_page.js';
@@ -299,52 +302,60 @@ async function fillAutoResizeTextareaInRow(
   rowIndex: number,
   value: string,
 ): Promise<boolean> {
-  return page.evaluate(
-    (kw: string, idx: number, v: string) => {
-      function norm(s: string) {
-        return (s ?? '').replace(/\s+/g, ' ').trim();
-      }
-      function setNativeValue(el: HTMLInputElement | HTMLTextAreaElement, val: string): void {
-        const tracker = (el as unknown as { _valueTracker?: { setValue: (x: string) => void } })._valueTracker;
-        if (tracker && typeof tracker.setValue === 'function') {
-          tracker.setValue('');
-        }
-        const proto =
-          el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-        if (desc?.set) {
-          desc.set.call(el, val);
-        } else {
-          el.value = val;
-        }
-      }
+  // 先定位并聚焦 textarea
+  const selector = await page.evaluate(
+    (kw: string, idx: number) => {
+      function norm(s: string) { return (s ?? '').replace(/\s+/g, ' ').trim(); }
       const h3s = Array.from(document.querySelectorAll('.form-content .form-content-title-h3'));
       const h3 = h3s.find((el) => norm(el.textContent ?? '').includes(kw));
       const section = h3 ? h3.closest('.form-content') : null;
-      if (!section) return false;
+      if (!section) return null;
       const items = section.querySelectorAll('.form-content-list .form-content-list-item');
-      if (idx < 0 || idx >= items.length) return false;
+      if (idx < 0 || idx >= items.length) return null;
       const row = items[idx];
       const wrap = row.querySelector('.auto-resize-textarea-wrapper');
-      if (!wrap) return false;
+      if (!wrap) return null;
       const el = wrap.querySelector('textarea, input');
-      if (!(el instanceof HTMLTextAreaElement) && !(el instanceof HTMLInputElement)) return false;
+      if (!(el instanceof HTMLTextAreaElement) && !(el instanceof HTMLInputElement)) return null;
       if (el instanceof HTMLInputElement && (el.type === 'hidden' || el.type === 'button' || el.type === 'submit')) {
-        return false;
+        return null;
       }
+      // 给元素添加临时标记，便于后续选择器定位
+      const marker = `__boss_ime_target_${Date.now()}`;
+      el.setAttribute('data-ime-target', marker);
       el.focus();
-      setNativeValue(el, v);
-      el.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, data: v }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      const titleWrap = row.querySelector('.form-content-list-item-title');
-      titleWrap?.classList.remove('error');
-      el.blur();
-      return true;
+      return `[data-ime-target="${marker}"]`;
     },
     titleKeyword,
     rowIndex,
-    value,
   );
+
+  if (!selector) return false;
+
+  // 先全选清空已有内容
+  const selectAllMod = selectAllModifierKey();
+  await page.keyboard.down(selectAllMod);
+  await page.keyboard.press('KeyA');
+  await page.keyboard.up(selectAllMod);
+  await sleepRandom(40, 80);
+  await page.keyboard.press('Backspace');
+  await sleepRandom(60, 120);
+
+  // 用 IME 事件流输入中文
+  await typeChineseWithIME(page, value, selector);
+
+  // 清除临时标记 + blur
+  await page.evaluate((sel: string) => {
+    const el = document.querySelector(sel);
+    if (el) {
+      el.removeAttribute('data-ime-target');
+      const titleWrap = el.closest('.form-content-list-item')?.querySelector('.form-content-list-item-title');
+      titleWrap?.classList.remove('error');
+      if (el instanceof HTMLElement) el.blur();
+    }
+  }, selector);
+
+  return true;
 }
 
 /** 用视口坐标点击 `.form-content-word` 中心，确保焦点落在真实文案节点上（比 programatic focus 更稳）。 */
@@ -740,7 +751,8 @@ async function fillRowAtIndexInSection(
   await page.keyboard.press('KeyA');
   await page.keyboard.up(selectAllMod);
   await sleepRandom(40, 80);
-  await page.keyboard.type(text, { delay: 12 });
+  await page.keyboard.press('Backspace');
+  await typeChineseWithIME(page, text);
   await page.keyboard.press('Tab');
   await sleepRandom(50, 100);
 
@@ -901,7 +913,8 @@ async function fillRequirementGroupRow(
   await page.keyboard.press('KeyA');
   await page.keyboard.up(selectAllMod);
   await sleepRandom(40, 80);
-  await page.keyboard.type(value, { delay: 12 });
+  await page.keyboard.press('Backspace');
+  await typeChineseWithIME(page, value);
   await page.keyboard.press('Tab');
   await sleepRandom(120, 220);
 
@@ -1284,8 +1297,8 @@ export async function selectAiFormJob(page: Page, keyword: string): Promise<stri
   await sleepRandom(JOB_SELECT_ACTION_GAP_MS.min, JOB_SELECT_ACTION_GAP_MS.max);
   await waitForAiFormJobDropdownReady(page);
 
+  // 聚焦岗位搜索输入框，然后用 IME 事件流输入
   const searched = (await page.evaluate(`(() => {
-    const kw = ${kwLiteral};
     const inputs = Array.from(
       document.querySelectorAll(
         ".ui-dropmenu-list input[type='text'], .ui-dropmenu-list input, .job-dropmenu-options .chat-job-search, .job-dropmenu-popover .chat-job-search, .top-chat-search .chat-job-search, input.chat-job-search",
@@ -1298,12 +1311,11 @@ export async function selectAiFormJob(page: Page, keyword: string): Promise<stri
     });
     if (!input) return false;
     input.focus();
-    input.value = kw;
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-    input.dispatchEvent(new Event("change", { bubbles: true }));
     return true;
   })()`)) as boolean;
   if (searched) {
+    // 用 IME 事件流输入岗位关键词
+    await typeChineseWithIME(page, kw);
     await sleepRandom(JOB_SEARCH_ACTION_GAP_MS.min, JOB_SEARCH_ACTION_GAP_MS.max);
     await waitForAiFormJobSearchResults(page, kw);
   }
@@ -1517,9 +1529,9 @@ export async function clickGreetDeepSearch(page: Page, target: string): Promise<
       if (disabled) {
         return { kind: "disabled", name };
       }
-      btn.scrollIntoView({ block: "center", inline: "nearest" });
-      btn.click();
-      return { kind: "clicked", name };
+      // 标记按钮供外部 humanClickSelector 定位
+      btn.setAttribute("data-boss-greet-target", "1");
+      return { kind: "ready_to_click", name };
     })()`,
   )) as
     | { kind: 'empty' }
@@ -1528,7 +1540,7 @@ export async function clickGreetDeepSearch(page: Page, target: string): Promise<
     | { kind: 'no_btn'; name: string }
     | { kind: 'not_greet'; name: string; label: string }
     | { kind: 'disabled'; name: string }
-    | { kind: 'clicked'; name: string };
+    | { kind: 'ready_to_click'; name: string };
 
   switch (result.kind) {
     case 'empty':
@@ -1545,7 +1557,14 @@ export async function clickGreetDeepSearch(page: Page, target: string): Promise<
       throw new Error(`候选人 ${result.name} 当前按钮为「${result.label}」，无法执行打招呼。`);
     case 'disabled':
       throw new Error(`候选人 ${result.name} 的打招呼不可用（可能已打过招呼）。`);
-    case 'clicked':
+    case 'ready_to_click':
+      // 用贝塞尔曲线鼠标移动 + 拟人点击
+      await humanClickSelector(page, '[data-boss-greet-target="1"]');
+      // 清除标记
+      await page.evaluate(() => {
+        const el = document.querySelector('[data-boss-greet-target="1"]');
+        el?.removeAttribute('data-boss-greet-target');
+      });
       return { message: `已对 ${result.name} 在深度搜索页点击「打招呼」。` };
     default: {
       const _x: never = result;
@@ -1603,10 +1622,11 @@ async function triggerAiFormMatch(page: Page): Promise<void> {
   }
 
   const beforeCountLiteral = JSON.stringify(before.remainingCountText);
-  const clicked = (await page.evaluate(`(() => {
+  // 先检查按钮状态
+  const btnStatus = (await page.evaluate(`(() => {
     const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
     const btn = document.querySelector(".ai-form-match-footer .btn-ai-match-v2");
-    if (!(btn instanceof HTMLElement)) return { ok: false, reason: "missing_button" };
+    if (!(btn instanceof HTMLElement)) return { ok: false, reason: "missing_button", text: "" };
     const cls = String(btn.className || "");
     const style = getComputedStyle(btn);
     const disabled =
@@ -1614,15 +1634,16 @@ async function triggerAiFormMatch(page: Page): Promise<void> {
       /disabled|forbid|ban/i.test(cls) ||
       style.pointerEvents === "none" ||
       Number(style.opacity) < 0.3;
-    if (disabled) return { ok: false, reason: "disabled", text: norm(btn.textContent) };
-    btn.scrollIntoView({ block: "center", inline: "nearest" });
-    btn.click();
-    return { ok: true, text: norm(btn.textContent) };
+    if (disabled) return { ok: false, reason: "disabled", text: norm(btn.textContent) || "" };
+    return { ok: true, text: norm(btn.textContent) || "" };
   })()`)) as { ok: boolean; reason?: string; text?: string };
 
-  if (!clicked.ok) {
-    throw new Error(`无法点击「立即匹配」：${clicked.reason ?? 'unknown'}${clicked.text ? `（${clicked.text}）` : ''}`);
+  if (!btnStatus.ok) {
+    throw new Error(`无法点击「立即匹配」：${btnStatus.reason ?? 'unknown'}${btnStatus.text ? `（${btnStatus.text}）` : ''}`);
   }
+
+  // 用贝塞尔曲线鼠标移动 + 拟人点击
+  await humanClickSelector(page, '.ai-form-match-footer .btn-ai-match-v2');
 
   await sleepRandom(900, 1400);
   await page.waitForFunction(

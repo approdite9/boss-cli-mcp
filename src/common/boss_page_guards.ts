@@ -1,5 +1,6 @@
 import type { Browser, CDPSession, Page, Target } from 'puppeteer-core';
 import { BOSS_CHAT_INDEX_URL } from './auth.js';
+import { BEHAVIOR_FETCH_PATTERNS, installBehaviorEnhancements } from './behavior_enhance.js';
 
 const SHOULD_ALLOW_CONSOLE_CLEAR =
   process.env.BOSS_BROWSER_ALLOW_CONSOLE_CLEAR === 'true' ||
@@ -438,6 +439,7 @@ async function ensurePageRequestGuard(page: Page): Promise<void> {
   await cdp.send('Fetch.enable', {
     patterns: [
       ...BLOCKED_SECURITY_SCRIPT_PATTERNS,
+      ...BEHAVIOR_FETCH_PATTERNS,
       ...REPORT_REQUEST_PATTERNS,
       ...RISK_NAVIGATION_PATTERNS,
     ],
@@ -489,6 +491,17 @@ export async function installBossPageGuards(page: Page): Promise<void> {
   await ensurePageInitGuard(page);
   ensurePageNavigationGuard(page);
   await ensurePageRequestGuard(page);
+  await installBehaviorEnhancements(page);
+
+  // 自动拒绝所有权限弹窗（"访问此设备上的其他应用和服务"等）
+  try {
+    const cdp = await page.createCDPSession();
+    await cdp.send('Browser.setPermission', {
+      permission: { name: 'window-management' },
+      setting: 'denied',
+    }).catch(() => {});
+    await cdp.detach().catch(() => {});
+  } catch { /* ignore - 不影响主流程 */ }
 }
 
 async function installTargetPageGuards(target: Target): Promise<void> {

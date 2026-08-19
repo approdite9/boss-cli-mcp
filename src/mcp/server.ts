@@ -324,8 +324,10 @@ const TOOL_SPECS: ToolSpec[] = [
   {
     name: 'boss_login',
     description:
-      '打开 Boss 直聘登录页（有界面窗口）。本工具不等待、不轮询、不校验登录结果，会立即返回：' +
-      '请把控制权交还给用户，由用户在浏览器里完成扫码/验证，再调用其它工具。',
+      '执行 Boss 直聘登录。有头模式下打开浏览器窗口让用户扫码（立即返回不等待）；' +
+      '无头模式（BOSS_BROWSER_HEADLESS=true）下截图二维码并轮询等待扫码完成，' +
+      '返回结果中包含 qrcodePath（截图路径）和 qrcodeBase64（图片 base64），' +
+      '请将二维码图片发送给用户扫码。等待最长 5 分钟，超时需重新调用。',
     annotations: { title: '打开登录页', readOnlyHint: false, openWorldHint: true },
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
     run: async () => implLogin(),

@@ -65,6 +65,11 @@ export const HEADLESS_REFUSAL_MESSAGE = [
 export function assertHeadfulRuntime(
   env: { BOSS_BROWSER_HEADLESS?: string } = process.env,
 ): void {
+  // CloakBrowser 模式允许无头：源码级补丁已消除 headless 检测信号
+  const engine = (process.env.BOSS_BROWSER_ENGINE ?? '').trim().toLowerCase();
+  if (engine === 'cloakbrowser' || engine === 'cloak') {
+    return;
+  }
   if (envTruthy(env.BOSS_BROWSER_HEADLESS)) {
     throw new Error(HEADLESS_REFUSAL_MESSAGE);
   }
@@ -83,6 +88,11 @@ export function assertUsableDisplay(
   env: { DISPLAY?: string; WAYLAND_DISPLAY?: string } = process.env,
   platform: string = process.platform,
 ): void {
+  // CloakBrowser 无头模式不需要 DISPLAY
+  const engine = (process.env.BOSS_BROWSER_ENGINE ?? '').trim().toLowerCase();
+  if (engine === 'cloakbrowser' || engine === 'cloak') {
+    return;
+  }
   if (platform !== 'linux') {
     return;
   }

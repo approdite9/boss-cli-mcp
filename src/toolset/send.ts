@@ -3,9 +3,8 @@ import {
   selectAllModifierKey,
   SEND_AFTER_ENTER_MS,
   SEND_INPUT_CLICK_MS,
-  SEND_TYPING_GAP_MS,
   sleepRandom,
-  typeTextWithRandomKeyDelay,
+  typeChineseWithIME,
 } from '../browser/index.js';
 import { isBossChatIndexUrl } from '../common/auth.js';
 import { withBossSessionPage } from '../common/boss_session_page.js';
@@ -49,13 +48,7 @@ export async function runSendChatMessage(options: SendChatMessageOptions): Promi
       await sleepRandom(45, 180, signal);
       await page.keyboard.press('Backspace');
       await sleepRandom(80, 260, signal);
-      await typeTextWithRandomKeyDelay(
-        page,
-        messageText,
-        SEND_TYPING_GAP_MS.min,
-        SEND_TYPING_GAP_MS.max,
-        signal,
-      );
+      await typeChineseWithIME(page, messageText);
       await sleepRandom(120, 420, signal);
       await page.keyboard.press('Enter');
       await sleepRandom(SEND_AFTER_ENTER_MS.min, SEND_AFTER_ENTER_MS.max, signal);

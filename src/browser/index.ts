@@ -27,3 +27,10 @@ export {
   getPageRef,
   setSessionPage,
 } from './browser_session.js';
+export {
+  humanMouseMove,
+  humanClick,
+  humanClickSelector,
+  typeChineseWithIME,
+  installBehaviorEnhancements,
+} from '../common/behavior_enhance.js';

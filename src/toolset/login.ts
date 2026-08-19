@@ -10,6 +10,7 @@ import {
   wasLastChromeLaunchHeadless,
 } from '../browser/index.js';
 
+import { runHeadlessLogin } from './login_headless.js';
 const BOSS_LOGIN_URL = 'https://www.zhipin.com/web/user/?ka=header-login';
 
 async function pickExistingPage(browser: Browser): Promise<Page | null> {
@@ -44,7 +45,26 @@ async function pickExistingPage(browser: Browser): Promise<Page | null> {
  * 不做登录态校验/等待/超时判断；成功与否由后续命令自行体现。
  */
 export async function runLogin(): Promise<string> {
-  // 登录必须可见：即使之前已启动 headless 会话，也需要重启为 headful。
+  // 判断运行模式：环境变量 BOSS_BROWSER_HEADLESS=true 时走纯无头截图二维码流程
+  const isHeadlessMode =
+    (process.env.BOSS_BROWSER_HEADLESS ?? '').trim().toLowerCase() === 'true' ||
+    (process.env.BOSS_BROWSER_HEADLESS ?? '').trim() === '1';
+
+  if (isHeadlessMode) {
+    // 纯无头模式：截图二维码 + 轮询等待
+    const result = await runHeadlessLogin({ waitForLogin: true, timeoutMs: 5 * 60 * 1000 });
+    const lines: string[] = [];
+    if (result.qrcodePath) {
+      lines.push(`二维码已保存: ${result.qrcodePath}`);
+    }
+    if (result.qrcodeBase64) {
+      lines.push(`二维码 Base64 (前100字符): ${result.qrcodeBase64.slice(0, 100)}...`);
+    }
+    lines.push(result.message);
+    return lines.join('\n');
+  }
+
+  // 有头模式：原有逻辑，弹出浏览器窗口让用户手动扫码
   process.env.BOSS_BROWSER_HEADLESS = 'false';
   const existing = getBrowserRef();
   try {
