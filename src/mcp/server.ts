@@ -13,9 +13,14 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListPromptsRequestSchema,
+  GetPromptRequestSchema,
   type CallToolResult,
   type Tool,
 } from '@modelcontextprotocol/sdk/types.js';
+import { readFileSync } from 'fs';
+import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { APP_HOME } from '../config.js';
 import { detachBrowserSession } from '../browser/index.js';
 import { getPackageMeta } from '../cli/version.js';
@@ -463,85 +468,85 @@ const TOOL_SPECS: ToolSpec[] = [
     },
     run: async (args) => implRecommend(optString(args, 'jobKeyword')),
   },
-  {
-    name: 'boss_search',
-    description: '进入「搜索」页读取 Boss 常规搜索结果；传 keyword 时会填入搜索框并回车搜索。',
-    annotations: { title: '常规搜索', readOnlyHint: false, openWorldHint: true },
-    inputSchema: {
-      type: 'object',
-      properties: {
-        keyword: { type: 'string', description: '可选：搜索关键词' },
-      },
-      additionalProperties: false,
-    },
-    run: async (args) => implNormalSearch(optString(args, 'keyword')),
-  },
-  {
-    name: 'boss_deep_search',
-    description:
-      '进入「深度搜索」页并回读当前状态：当前表单条件、剩余匹配次数、「立即匹配」按钮状态。' +
-      '本工具**不会**点击匹配，不消耗任何配额。要改条件用 boss_deep_search_set，要真正匹配用 boss_deep_search_match。',
-    annotations: { title: '深度搜索（查看状态）', readOnlyHint: false, openWorldHint: true },
-    inputSchema: {
-      type: 'object',
-      properties: {
-        jobKeyword: { type: 'string', description: '可选：岗位关键字，先切换岗位再回读' },
-      },
-      additionalProperties: false,
-    },
-    run: async (args) => implBossSearch({ jobKeyword: optString(args, 'jobKeyword'), match: false }),
-  },
-  {
-    name: 'boss_deep_search_set',
-    description:
-      '只设置「深度搜索」表单（岗位 / 核心要求 / 加分项）并回读当前状态，**不点击「立即匹配」**，不消耗配额。' +
-      'core/bonus 传入即按该列表同步对应分组，传空数组表示清空该分组。' +
-      '典型用法：LLM 读完 JD 拆出 core/bonus 后调本工具建表单，再由用户确认后调 boss_deep_search_match。',
-    annotations: { title: '深度搜索（设置表单）', readOnlyHint: false, openWorldHint: true },
-    inputSchema: {
-      type: 'object',
-      properties: {
-        jobKeyword: { type: 'string', description: '可选：岗位关键字' },
-        core: { type: 'array', items: { type: 'string' }, description: '核心要求列表；空数组=清空' },
-        bonus: { type: 'array', items: { type: 'string' }, description: '加分项列表；空数组=清空' },
-      },
-      additionalProperties: false,
-    },
-    run: async (args) =>
-      implBossSearchSet({
-        jobKeyword: optString(args, 'jobKeyword'),
-        coreRequirements: optStringList(args, 'core'),
-        bonusRequirements: optStringList(args, 'bonus'),
-      }),
-  },
-  {
-    name: 'boss_deep_search_match',
-    description:
-      '⚠️【消耗今日深度搜索匹配次数，务必先与用户确认】点击「立即匹配」并返回匹配到的候选人列表（顶部最新 20 条）。' +
-      '可同时传 core/bonus 先同步表单再匹配。返回的候选人可由你解析后用 pool_add 存入候选人集合。',
-    annotations: {
-      title: '深度搜索（执行匹配，消耗配额）',
-      readOnlyHint: false,
-      destructiveHint: true,
-      openWorldHint: true,
-    },
-    inputSchema: {
-      type: 'object',
-      properties: {
-        jobKeyword: { type: 'string', description: '可选：岗位关键字' },
-        core: { type: 'array', items: { type: 'string' }, description: '可选：匹配前同步核心要求' },
-        bonus: { type: 'array', items: { type: 'string' }, description: '可选：匹配前同步加分项' },
-      },
-      additionalProperties: false,
-    },
-    run: async (args) =>
-      implBossSearch({
-        jobKeyword: optString(args, 'jobKeyword'),
-        coreRequirements: optStringList(args, 'core'),
-        bonusRequirements: optStringList(args, 'bonus'),
-        match: true,
-      }),
-  },
+//   {
+//     name: 'boss_search',
+//     description: '进入「搜索」页读取 Boss 常规搜索结果；传 keyword 时会填入搜索框并回车搜索。',
+//     annotations: { title: '常规搜索', readOnlyHint: false, openWorldHint: true },
+//     inputSchema: {
+//       type: 'object',
+//       properties: {
+//         keyword: { type: 'string', description: '可选：搜索关键词' },
+//       },
+//       additionalProperties: false,
+//     },
+//     run: async (args) => implNormalSearch(optString(args, 'keyword')),
+//   },
+//   {
+//     name: 'boss_deep_search',
+//     description:
+//       '进入「深度搜索」页并回读当前状态：当前表单条件、剩余匹配次数、「立即匹配」按钮状态。' +
+//       '本工具**不会**点击匹配，不消耗任何配额。要改条件用 boss_deep_search_set，要真正匹配用 boss_deep_search_match。',
+//     annotations: { title: '深度搜索（查看状态）', readOnlyHint: false, openWorldHint: true },
+//     inputSchema: {
+//       type: 'object',
+//       properties: {
+//         jobKeyword: { type: 'string', description: '可选：岗位关键字，先切换岗位再回读' },
+//       },
+//       additionalProperties: false,
+//     },
+//     run: async (args) => implBossSearch({ jobKeyword: optString(args, 'jobKeyword'), match: false }),
+//   },
+//   {
+//     name: 'boss_deep_search_set',
+//     description:
+//       '只设置「深度搜索」表单（岗位 / 核心要求 / 加分项）并回读当前状态，**不点击「立即匹配」**，不消耗配额。' +
+//       'core/bonus 传入即按该列表同步对应分组，传空数组表示清空该分组。' +
+//       '典型用法：LLM 读完 JD 拆出 core/bonus 后调本工具建表单，再由用户确认后调 boss_deep_search_match。',
+//     annotations: { title: '深度搜索（设置表单）', readOnlyHint: false, openWorldHint: true },
+//     inputSchema: {
+//       type: 'object',
+//       properties: {
+//         jobKeyword: { type: 'string', description: '可选：岗位关键字' },
+//         core: { type: 'array', items: { type: 'string' }, description: '核心要求列表；空数组=清空' },
+//         bonus: { type: 'array', items: { type: 'string' }, description: '加分项列表；空数组=清空' },
+//       },
+//       additionalProperties: false,
+//     },
+//     run: async (args) =>
+//       implBossSearchSet({
+//         jobKeyword: optString(args, 'jobKeyword'),
+//         coreRequirements: optStringList(args, 'core'),
+//         bonusRequirements: optStringList(args, 'bonus'),
+//       }),
+//   },
+//   {
+//     name: 'boss_deep_search_match',
+//     description:
+//       '⚠️【消耗今日深度搜索匹配次数，务必先与用户确认】点击「立即匹配」并返回匹配到的候选人列表（顶部最新 20 条）。' +
+//       '可同时传 core/bonus 先同步表单再匹配。返回的候选人可由你解析后用 pool_add 存入候选人集合。',
+//     annotations: {
+//       title: '深度搜索（执行匹配，消耗配额）',
+//       readOnlyHint: false,
+//       destructiveHint: true,
+//       openWorldHint: true,
+//     },
+//     inputSchema: {
+//       type: 'object',
+//       properties: {
+//         jobKeyword: { type: 'string', description: '可选：岗位关键字' },
+//         core: { type: 'array', items: { type: 'string' }, description: '可选：匹配前同步核心要求' },
+//         bonus: { type: 'array', items: { type: 'string' }, description: '可选：匹配前同步加分项' },
+//       },
+//       additionalProperties: false,
+//     },
+//     run: async (args) =>
+//       implBossSearch({
+//         jobKeyword: optString(args, 'jobKeyword'),
+//         coreRequirements: optStringList(args, 'core'),
+//         bonusRequirements: optStringList(args, 'bonus'),
+//         match: true,
+//       }),
+//   },
   {
     name: 'boss_greet',
     description:
@@ -961,8 +966,63 @@ const { name: pkgName, version: pkgVersion } = resolvePackageMeta();
 
 const server = new Server(
   { name: 'boss-cli', version: pkgVersion },
-  { capabilities: { tools: {} } },
+  { capabilities: { tools: {}, prompts: {} } },
 );
+
+// ── Prompts（暴露 skills 目录下的 SKILL.md 作为可调用 prompt） ──────────────
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const SKILLS_DIR = resolve(__dirname, '../../skills');
+
+const PROMPTS = [
+  {
+    name: 'boss-agent-review',
+    description: '基于JD自动筛选Boss直聘推荐候选人，三阶漏斗（标签初筛→简历精筛→HR确认），最终批量打招呼。',
+    arguments: [
+      { name: 'count', description: '加载候选人数量（默认150）', required: false },
+      { name: 'greet_limit', description: '打招呼数量上限（默认50）', required: false },
+    ],
+  },
+  {
+    name: 'boss-batch-review',
+    description: '在Boss直聘推荐页逐批展示候选人供HR实时审核并打招呼。',
+    arguments: [
+      { name: 'count', description: '加载候选人数量（默认50）', required: false },
+      { name: 'batch_size', description: '每批展示人数（默认10）', required: false },
+    ],
+  },
+];
+
+server.setRequestHandler(ListPromptsRequestSchema, async () => ({
+  prompts: PROMPTS,
+}));
+
+server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
+  const skillFile = resolve(SKILLS_DIR, name, 'SKILL.md');
+
+  let content: string;
+  try {
+    content = readFileSync(skillFile, 'utf-8');
+  } catch {
+    throw new Error(`Skill not found: ${name}`);
+  }
+
+  // 替换模板变量 {{count}}, {{greet_limit}}, {{batch_size}}
+  if (args?.count) content = content.replaceAll('{{count}}', args.count);
+  if (args?.greet_limit) content = content.replaceAll('{{greet_limit}}', args.greet_limit);
+  if (args?.batch_size) content = content.replaceAll('{{batch_size}}', args.batch_size);
+
+  return {
+    messages: [
+      {
+        role: 'user',
+        content: { type: 'text', text: content },
+      },
+    ],
+  };
+});
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
