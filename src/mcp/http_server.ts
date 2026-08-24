@@ -207,8 +207,21 @@ async function handleInitialize(
   await transport.handleRequest(req, res, body);
 }
 
-/** 每个请求一份的可变上下文；目前只用于把 JSON-RPC 方法名回传给 access log。 */
-type RequestTrace = { rpcMethod?: string };
+/** 每个请求一份的可变上下文，供 access log 回读处理过程中才知道的信息。 */
+type RequestTrace = {
+  rpcMethod?: string;
+  /** `handleMcpRequest` 返回时的耗时；与响应流存活时长分开记，见 http_log.ts 的说明 */
+  handlerMs?: number;
+};
+
+/** 优先取 Nginx 透传的真实客户端地址，回落到直连的 socket 地址。 */
+function clientIpOf(req: IncomingMessage): string | undefined {
+  const xff = req.headers['x-forwarded-for'];
+  const raw = Array.isArray(xff) ? xff[0] : xff;
+  const first = (raw ?? '').split(',')[0]?.trim();
+  if (first) return first;
+  return req.socket.remoteAddress ?? undefined;
+}
 
 async function handleMcpRequest(
   req: IncomingMessage,
@@ -285,8 +298,10 @@ const httpServer = createServer((req, res) => {
       method: req.method ?? '-',
       rpcMethod: trace.rpcMethod,
       sessionId: sessionIdOf(req),
+      ip: clientIpOf(req),
       status: res.statusCode,
-      durationMs: Date.now() - startedAt,
+      handlerMs: trace.handlerMs,
+      streamMs: Date.now() - startedAt,
     });
   };
   res.on('finish', logOnce);
@@ -300,11 +315,16 @@ const httpServer = createServer((req, res) => {
     return;
   }
 
-  void handleMcpRequest(req, res, trace).catch((e: unknown) => {
-    const message = e instanceof Error ? e.message : String(e);
-    logServer('ERROR', `请求处理失败：${message}`);
-    sendJsonRpcError(res, 500, -32603, `Internal error: ${message}`);
-  });
+  void handleMcpRequest(req, res, trace)
+    .catch((e: unknown) => {
+      const message = e instanceof Error ? e.message : String(e);
+      logServer('ERROR', `请求处理失败：${message}`);
+      sendJsonRpcError(res, 500, -32603, `Internal error: ${message}`);
+    })
+    .finally(() => {
+      // 处理已结束；此后 streamMs 继续增长的部分全都是「等响应流真正关闭」，与服务端快慢无关。
+      trace.handlerMs = Date.now() - startedAt;
+    });
 });
 
 // ── 生命周期 ──────────────────────────────────────────────────

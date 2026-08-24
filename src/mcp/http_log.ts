@@ -45,13 +45,32 @@ export type AccessRecord = {
   /** JSON-RPC method（如 initialize / tools/call），非 JSON-RPC 请求为 undefined */
   rpcMethod?: string;
   sessionId?: string;
+  /** 对端地址；经 Nginx 时取 X-Forwarded-For，用于区分本机测试与远程客户端 */
+  ip?: string;
   status: number;
-  durationMs: number;
+  /**
+   * 处理耗时：从收到请求到 `transport.handleRequest` 返回。
+   * 这才是「服务端是否慢」的度量。
+   */
+  handlerMs?: number;
+  /**
+   * 响应流存活时长：从收到请求到 HTTP 响应真正结束（`finish` / `close`）。
+   *
+   * SSE 模式下这个值**远大于** `handlerMs` 是正常的:应答写完后 SDK 调 `res.end()`，
+   * 若对端已静默消失，终止 chunk 刷不出去，内核重传退避可以让它挂十几分钟。
+   * 那种情况下 `handlerMs` 很小而 `streamMs` 极大——**这个组合表示对端死了，不是服务端卡了**。
+   */
+  streamMs: number;
 };
 
 /**
- * 逐请求一行。`durationMs` 是定位假死的关键字段——
- * 历史上那次 6 分钟卡死就是靠 `initialize ... 347656ms` 这一行才定位到 `close()` 上的。
+ * 逐请求一行。
+ *
+ * 为什么要把 handler 与 stream 分开记:早期只记一个 `duration`（等价于这里的 `streamMs`），
+ * 结果把「对端消失导致响应流挂住」误读成「服务端处理阻塞」，排查绕了一大圈。
+ * 两个字段分开后:
+ *   handler 大        → 服务端真的慢，查业务与队列
+ *   handler 小 stream 大 → 对端已消失，属正常的 TCP 收尾，服务本身健康
  */
 export function logAccess(rec: AccessRecord): void {
   write(
@@ -60,9 +79,11 @@ export function logAccess(rec: AccessRecord): void {
       ts(),
       rec.method,
       rec.rpcMethod ?? '-',
+      `ip=${rec.ip ?? '-'}`,
       `session=${rec.sessionId ?? '-'}`,
       `status=${rec.status}`,
-      `duration=${rec.durationMs}ms`,
+      `handler=${rec.handlerMs === undefined ? '-' : `${rec.handlerMs}ms`}`,
+      `stream=${rec.streamMs}ms`,
     ].join(' '),
   );
 }
