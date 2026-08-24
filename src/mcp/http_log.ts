@@ -46,11 +46,21 @@ function write(file: string, line: string): void {
 
 export type LogLevel = 'INFO' | 'WARN' | 'ERROR';
 
-/** 运行事件：同时写 stderr（便于前台启动时观察）与 mcp-server.log。 */
+/**
+ * 运行事件：同时写 mcp-server.log 与 stderr（便于前台启动时观察）。
+ *
+ * **落盘必须在 console 之前**：Windows 控制台开启「快速编辑模式」时，只要有人在窗口里
+ * 点一下或拖选文本，进程就会在下一次写 stdout/stderr 时被**挂起**（不是崩溃，不是退出）。
+ * 若先写 console，进程冻在那一行，文件日志一个字都留不下——排查时会看到
+ * 「Nginx 有请求记录、应用日志完全空白」这种对不上的现象，极难定位。
+ * 先落盘至少能保住最后一条线索。
+ *
+ * 根治办法是别让服务依赖交互式控制台（输出重定向到文件，或用任务计划隐藏窗口运行）。
+ */
 export function logServer(level: LogLevel, message: string): void {
   const line = `${ts()} [${level}] ${message}`;
-  console.error(`[boss-mcp] ${message}`);
   write(SERVER_LOG, line);
+  console.error(`[boss-mcp] ${message}`);
 }
 
 export type AccessRecord = {
