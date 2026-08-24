@@ -358,6 +358,31 @@ type C:\nginx\logs\auth_debug.log
 powershell "Get-Content C:\Users\bowen\.boss-cli\logs\mcp-access.log -Wait -Tail 20"
 ```
 
+> 日志是 UTF-8（带 BOM）。`Get-Content` 能正确识别；直接用 `type` 需要先 `chcp 65001`，
+> 否则中文会按 GBK 解码成乱码，甚至因多字节序列吞掉换行让整段连成一行。
+
+### access log 字段怎么读
+
+```
+2026-08-24T06:51:09.485Z POST initialize ip=107.20.212.21 session=- status=200 handler=0ms stream=0ms
+```
+
+| 字段 | 含义 |
+|------|------|
+| `ip` | 真实客户端地址（取 `X-Forwarded-For`）。用来区分本机探测与远程客户端 |
+| `session` | `Mcp-Session-Id`；`initialize` 时必然是 `-` |
+| `handler` | **处理耗时**，到 `handleRequest` 返回为止。这才是「服务端是否慢」的度量 |
+| `stream` | **响应流存活时长**，到 HTTP 响应真正结束为止 |
+
+判读规则：
+
+- `handler` 大 → 服务端真的慢，查串行队列与业务
+- `handler` 小、`stream` 极大 → **对端已消失**，`res.end()` 在等 TCP 重传，属正常收尾，服务本身健康
+- GET（通知流）的 `handler` 显示 `-`：长连接的「处理耗时」无意义，`close` 事件先于 promise 落地
+
+> 早期只有一个合并的 `duration` 字段（等价于 `stream`），曾把「对端消失」误读成「服务端阻塞」，
+> 排查绕了一大圈。拆开就是为了避免重犯。
+
 ### 更新代码
 
 ```cmd
@@ -544,7 +569,12 @@ browserCallThrottle.afterCall()
 | BOSS_MCP_CALL_GAP_MS | 1800-5000 | 调用间随机间隔（ms） |
 | BOSS_MCP_PORT | 3101 | HTTP 监听端口 |
 | BOSS_MCP_HOST | 127.0.0.1 | HTTP 绑定地址。**非回环会打出告警**：本进程零鉴权 |
-| BOSS_MCP_SESSION_IDLE_MS | 600000 (10min) | 会话空闲回收阈值（兜静默消失的客户端） |
+| BOSS_MCP_SESSION_IDLE_MS | 14400000 (4h) | 会话空闲回收阈值。**只是兜底**，主回收路径是 `transport.onclose` |
+
+> ⚠️ 不要把 `BOSS_MCP_SESSION_IDLE_MS` 调小。交互式客户端在人思考/读结果时可以空闲很久，
+> 期间它只挂着 GET 通知流、不发新请求。会话被摘掉后客户端下一次调用拿到 404，
+> 表现是「MCP 未连接」——而它其实一直连着。会话对象很小，留久没有代价。
+> 实测踩过：阈值设 10 分钟时，客户端空闲 15 分钟后 `tools/list` 直接 404。
 
 > `BOSS_MCP_TOOL_TIMEOUT_MS` 必须小于 Nginx 的 `proxy_read_timeout`（当前 300s），
 > 否则 Nginx 先掐断连接，客户端拿到的是连接中断而不是那条可读的超时说明。

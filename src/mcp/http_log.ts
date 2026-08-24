@@ -11,7 +11,7 @@
  * 写入用同步 append：日志量很小（每请求一行），而一旦改成异步缓冲，
  * 进程假死或被 taskkill 时最关键的那几行恰好会丢——那正是要看的内容。
  */
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ensureAppDataLayout, LOGS_DIR } from '../config.js';
 
@@ -22,10 +22,23 @@ function ts(): string {
   return new Date().toISOString();
 }
 
+/**
+ * 首次创建日志文件时写入 UTF-8 BOM。
+ *
+ * 日志内容含中文，而这些文件的主要读者是 Windows 上的 `type` 与 `Get-Content`——
+ * 两者默认按系统 ANSI 代码页（简中环境为 GBK）解码，会把 UTF-8 全部显示成乱码，
+ * 甚至因为多字节序列吞掉换行而让整段日志连成一行。BOM 能让它们正确识别编码。
+ */
+function ensureLogFile(file: string): void {
+  if (existsSync(file)) return;
+  writeFileSync(file, '\uFEFF', 'utf8');
+}
+
 function write(file: string, line: string): void {
   try {
     ensureAppDataLayout();
-    appendFileSync(file, line + '\n', 'utf8');
+    ensureLogFile(file);
+    appendFileSync(file, line + '\r\n', 'utf8');
   } catch {
     /* 日志写不进去不该影响服务本身 */
   }

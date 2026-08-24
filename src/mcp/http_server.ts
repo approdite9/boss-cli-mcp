@@ -72,14 +72,21 @@ const MCP_PATH = '/mcp';
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 
 /**
- * 会话空闲回收阈值。客户端正常断开会触发 `transport.onclose` 立即摘除；
- * 这个阈值只用于兜住「客户端静默消失、连 FIN 都没发」的会话，避免表无限增长。
+ * 会话空闲回收阈值。
+ *
+ * 这只是**兜底**，不是主回收路径：客户端正常断开会触发 `transport.onclose` 立即摘除。
+ * 它存在的唯一目的是防止「静默消失、连 FIN 都没发」的会话让表无限增长。
+ *
+ * 因此阈值要给得宽。交互式 MCP 客户端在人思考、读结果时可以空闲很久，而空闲期间
+ * 它只是挂着 GET 通知流、不发新请求。摘掉这种会话会让客户端下一次调用拿到 404，
+ * 表现为「MCP 未连接」——而它其实一直连着。会话对象本身很小，留久一点没有代价。
  */
 const SESSION_IDLE_MS = (() => {
+  const fallback = 4 * 60 * 60_000;
   const raw = process.env.BOSS_MCP_SESSION_IDLE_MS?.trim();
-  if (!raw) return 10 * 60_000;
+  if (!raw) return fallback;
   const n = Number.parseInt(raw, 10);
-  if (!Number.isInteger(n) || n < 60_000) return 10 * 60_000;
+  if (!Number.isInteger(n) || n < 60_000) return fallback;
   return n;
 })();
 
@@ -162,7 +169,9 @@ function sendJsonRpcError(
     res.end();
     return;
   }
-  res.writeHead(status, { 'content-type': 'application/json' });
+  // 必须显式声明 charset：错误消息是中文，缺 charset 时不少客户端按 latin1 解码成乱码，
+  // 而这些消息正是排查时唯一的线索。
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify({ jsonrpc: '2.0', id: id ?? null, error: { code, message } }));
 }
 
@@ -207,6 +216,21 @@ async function handleInitialize(
   await transport.handleRequest(req, res, body);
 }
 
+/**
+ * 会话查不到时统一走这里：除了回 404，还要**留一条日志**。
+ *
+ * 没有这条日志时，「客户端拿着已回收的 session id 来调用」在服务端看起来和「请求没到」
+ * 难以区分，只能靠时间戳去反推回收窗口。
+ */
+function rejectUnknownSession(res: ServerResponse, sessionId: string | undefined): void {
+  logServer(
+    'INFO',
+    `拒绝未知会话 ${sessionId ?? '(无 Mcp-Session-Id)'}：已被回收或从未存在，客户端需重新 initialize` +
+      `（当前会话数 ${sessions.size}）`,
+  );
+  sendJsonRpcError(res, 404, -32001, '未知或已过期的会话，请重新 initialize');
+}
+
 /** 每个请求一份的可变上下文，供 access log 回读处理过程中才知道的信息。 */
 type RequestTrace = {
   rpcMethod?: string;
@@ -233,11 +257,17 @@ async function handleMcpRequest(
     const id = sessionIdOf(req);
     const s = id ? sessions.get(id) : undefined;
     if (!s) {
-      sendJsonRpcError(res, 404, -32001, '未知或已过期的会话，请重新 initialize');
+      rejectUnknownSession(res, id);
       return;
     }
     s.lastSeen = Date.now();
-    await s.transport.handleRequest(req, res);
+    try {
+      await s.transport.handleRequest(req, res);
+    } finally {
+      // GET 通知流可能挂很久且期间不产生新请求。流结束时再刷一次时间戳，
+      // 否则「挂着长连接但空闲」的活跃客户端会被空闲回收误判为已消失。
+      s.lastSeen = Date.now();
+    }
     return;
   }
 
@@ -273,7 +303,7 @@ async function handleMcpRequest(
   }
   const s = sessions.get(id);
   if (!s) {
-    sendJsonRpcError(res, 404, -32001, '未知或已过期的会话，请重新 initialize');
+    rejectUnknownSession(res, id);
     return;
   }
   s.lastSeen = Date.now();
