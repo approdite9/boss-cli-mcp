@@ -666,8 +666,11 @@ powercfg /change monitor-timeout-ac 0
 **3. 注册主任务**
 
 ```cmd
-schtasks /create /tn "boss-mcp" /tr "wscript.exe \"C:\Users\bowen\boss-cli\scripts\win-service\run-mcp.vbs\"" /sc onlogon /ru bowen /rl highest /f
+schtasks /create /tn "boss-mcp" /tr "wscript.exe C:\Users\bowen\boss-cli\scripts\win-service\run-mcp.vbs" /sc onlogon /ru bowen /rl highest /f
 ```
+
+> 路径里没有空格，所以 `/tr` 内部不需要再嵌套引号。schtasks 对 `\"` 的处理很容易出错，
+> 若将来路径含空格，请改用任务计划 GUI 创建而不是硬拼转义。
 
 然后在 `taskschd.msc` 里打开 boss-mcp → **设置**页，必须调整两项默认值：
 
@@ -679,7 +682,7 @@ schtasks /create /tn "boss-mcp" /tr "wscript.exe \"C:\Users\bowen\boss-cli\scrip
 **4. 注册看门狗任务**（每 2 分钟）
 
 ```cmd
-schtasks /create /tn "boss-mcp-watchdog" /tr "powershell -ExecutionPolicy Bypass -NoProfile -File \"C:\Users\bowen\boss-cli\scripts\win-service\watchdog-mcp.ps1\"" /sc minute /mo 2 /ru bowen /rl highest /f
+schtasks /create /tn "boss-mcp-watchdog" /tr "powershell -ExecutionPolicy Bypass -NoProfile -File C:\Users\bowen\boss-cli\scripts\win-service\watchdog-mcp.ps1" /sc minute /mo 2 /ru bowen /rl highest /f
 ```
 
 ### 看门狗做什么
