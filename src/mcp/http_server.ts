@@ -42,7 +42,11 @@ import {
   logStartupBanner,
   releaseSharedResources,
 } from './app.js';
-import { logAccess, logServer } from './http_log.js';
+import { installConsoleCapture, logAccess, logServer } from './mcp_log.js';
+
+// 必须在任何输出之前：共享层到处直接用 console.error（工具失败、CDP 断连、未捕获异常），
+// 这些是最有诊断价值的行，而隐藏窗口运行时没人看 stderr。装上后它们一并落盘。
+installConsoleCapture();
 
 // ── 配置 ──────────────────────────────────────────────────────
 
@@ -272,7 +276,9 @@ function rejectUnknownSession(res: ServerResponse, sessionId: string | undefined
 /** 每个请求一份的可变上下文，供 access log 回读处理过程中才知道的信息。 */
 type RequestTrace = {
   rpcMethod?: string;
-  /** `handleMcpRequest` 返回时的耗时；与响应流存活时长分开记，见 http_log.ts 的说明 */
+  /** `tools/call` 时的具体工具名——只有 rpcMethod 分不出是 pool_list 还是 boss_greet */
+  toolName?: string;
+  /** `handleMcpRequest` 返回时的耗时；与响应流存活时长分开记，见 mcp_log.ts 的说明 */
   handlerMs?: number;
 };
 
@@ -327,6 +333,11 @@ async function handleMcpRequest(
   if (body && typeof body === 'object' && !Array.isArray(body)) {
     const m = (body as { method?: unknown }).method;
     if (typeof m === 'string') trace.rpcMethod = m;
+    const params = (body as { params?: unknown }).params;
+    if (params && typeof params === 'object' && !Array.isArray(params)) {
+      const n = (params as { name?: unknown }).name;
+      if (typeof n === 'string') trace.toolName = n;
+    }
   }
 
   if (isInitializeRequest(body)) {
@@ -365,6 +376,7 @@ const httpServer = createServer((req, res) => {
     logAccess({
       method: req.method ?? '-',
       rpcMethod: trace.rpcMethod,
+      toolName: trace.toolName,
       sessionId: sessionIdOf(req),
       ip: clientIpOf(req),
       status: res.statusCode,
@@ -428,11 +440,23 @@ async function shutdown(reason: string): Promise<void> {
   }
 
   await releaseSharedResources();
+  logServer('INFO', '已退出（StreamableHTTP）');
   process.exit(0);
 }
 
 process.on('SIGINT', () => void shutdown('SIGINT'));
 process.on('SIGTERM', () => void shutdown('SIGTERM'));
+
+/**
+ * 非正常退出也要留痕。`schtasks /end`、`taskkill`、以及「事件循环空了自然退出」
+ * 都不会经过 {@link shutdown}，此前这类退出在应用日志里完全没有记录，
+ * 只有 `run-mcp.cmd` 那句 "exited with code N"——而它不带时间以外的任何上下文。
+ */
+process.on('exit', (code) => {
+  if (!shuttingDown) {
+    logServer('WARN', `进程退出（code=${code}），未经过正常 shutdown 流程`);
+  }
+});
 
 /**
  * 监听失败必须**硬失败并给出非零退出码**。

@@ -31,6 +31,7 @@ import { detachBrowserSession } from '../browser/index.js';
 import { getPackageMeta } from '../cli/version.js';
 import { runToolCall, textResult, type ToolContext } from './dispatch.js';
 import { formatEnvLoadReport, loadMcpEnv } from './env.js';
+import { logAudit } from './mcp_log.js';
 import {
   assertDebugPortBrowserIsHeadful,
   assertHeadfulRuntime,
@@ -323,6 +324,40 @@ const CHAT_ACTION_ALIASES: Record<string, ChatPageAction> = {
   wechat: 'exchange-wechat',
   'exchange-wechat': 'exchange-wechat',
 };
+
+/**
+ * 会消耗平台不可逆额度的工具，仅用于审计日志打标。
+ *
+ * 与 `local_guard.ts` 的 `LOCAL_ONLY_TOOLS`（判断是否需要节流）**不是同一件事**：
+ * 那个问的是「碰不碰浏览器」，这里问的是「花不花真实额度」。
+ * 例如 `boss_recommend` 碰浏览器但不花额度，`pool_get_detail` 传 preview=true 时才花。
+ * 判定方向保守：宁可多标，也不要漏掉一个花钱的动作。
+ */
+const QUOTA_CONSUMING_TOOLS: ReadonlySet<string> = new Set([
+  'boss_greet',
+  'boss_preview_resume',
+  'boss_chat_action', // action=resume 会打开在线简历
+  'pool_get_detail', // preview=true 会打开在线简历
+  'pool_greet_all',
+  'pool_batch_resume',
+]);
+
+/** 审计日志里单个字段的长度上限：简历正文、候选人列表都可能很长，不能整段写进日志。 */
+const AUDIT_FIELD_MAX = 300;
+
+function summarizeForAudit(raw: string): string {
+  const oneLine = raw.replace(/\s+/g, ' ').trim();
+  if (oneLine.length <= AUDIT_FIELD_MAX) return oneLine;
+  return `${oneLine.slice(0, AUDIT_FIELD_MAX)}…(共 ${oneLine.length} 字)`;
+}
+
+function firstTextOf(result: CallToolResult): string {
+  const first = result.content?.[0];
+  if (first && first.type === 'text' && typeof first.text === 'string') {
+    return first.text;
+  }
+  return '(无文本内容)';
+}
 
 // ── Tool 定义：schema 与实现放在一处，避免两边漂移 ──
 type ToolSpec = Tool & {
@@ -1072,7 +1107,8 @@ export function buildServer(): Server {
         });
     };
 
-    return serialize(() =>
+    const auditStartedAt = Date.now();
+    const result = await serialize(() =>
       runToolCall({
         toolName,
         signal: extra.signal,
@@ -1101,6 +1137,17 @@ export function buildServer(): Server {
         },
       }),
     );
+
+    logAudit({
+      toolName,
+      consumesQuota: QUOTA_CONSUMING_TOOLS.has(toolName),
+      args: summarizeForAudit(JSON.stringify(args)),
+      outcome: result.isError === true ? 'error' : 'ok',
+      durationMs: Date.now() - auditStartedAt,
+      summary: summarizeForAudit(firstTextOf(result)),
+    });
+
+    return result;
   });
 
   return srv;

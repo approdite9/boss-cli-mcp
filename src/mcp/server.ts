@@ -14,7 +14,10 @@ import {
   logStartupBanner,
   releaseSharedResources,
 } from './app.js';
+import { installConsoleCapture, logServer } from './mcp_log.js';
 
+// stdio 下 stderr 由客户端接管，多数客户端并不展示它。一并落盘便于事后排查。
+installConsoleCapture();
 installProcessSafetyNets();
 
 let shuttingDown = false;
@@ -28,8 +31,9 @@ async function shutdown(reason: string): Promise<void> {
     return;
   }
   shuttingDown = true;
-  console.error(`[boss-mcp] 正在退出（${reason}），断开 CDP 但保留浏览器窗口…`);
+  logServer('INFO', `正在退出（${reason}），断开 CDP 但保留浏览器窗口…`);
   await releaseSharedResources();
+  logServer('INFO', '已退出（stdio）');
   process.exit(0);
 }
 
