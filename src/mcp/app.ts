@@ -1010,20 +1010,30 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const SKILLS_DIR = resolve(__dirname, '../../skills');
 
+/**
+ * 可调用的 prompt 清单。
+ *
+ * 注意这里的 `arguments` 必须和对应 SKILL.md 里的 `{{占位符}}` 对得上。
+ * 曾经声明过 `count`（"加载候选人数量"），但 `boss_recommend` **没有** count 参数
+ * （schema 只有 `jobKeyword` 且 `additionalProperties: false`），照着填会被直接拒掉。
+ * 已随 SKILL.md 一并移除。
+ */
 const PROMPTS = [
   {
     name: 'boss-agent-review',
     description: '基于JD自动筛选Boss直聘推荐候选人，三阶漏斗（标签初筛→简历精筛→HR确认），最终批量打招呼。',
     arguments: [
-      { name: 'count', description: '加载候选人数量（默认150）', required: false },
-      { name: 'greet_limit', description: '打招呼数量上限（默认50）', required: false },
+      {
+        name: 'greet_limit',
+        description: `本次打招呼上限（默认 ${GREET_BATCH_HARD_LIMIT}，也是单次调用硬上限）`,
+        required: false,
+      },
     ],
   },
   {
     name: 'boss-batch-review',
     description: '在Boss直聘推荐页逐批展示候选人供HR实时审核并打招呼。',
     arguments: [
-      { name: 'count', description: '加载候选人数量（默认50）', required: false },
       { name: 'batch_size', description: '每批展示人数（默认10）', required: false },
     ],
   },
@@ -1061,8 +1071,8 @@ export function buildServer(): Server {
       throw new Error(`Skill not found: ${name}`);
     }
 
-    // 替换模板变量 {{count}}, {{greet_limit}}, {{batch_size}}
-    if (args?.count) content = content.replaceAll('{{count}}', args.count);
+    // 替换模板变量。未传的占位符保留原样——SKILL.md 里紧邻处都写了默认值，
+    // 留着 `{{greet_limit}}` 比替换成一个凭空编的数字更不容易误导。
     if (args?.greet_limit) content = content.replaceAll('{{greet_limit}}', args.greet_limit);
     if (args?.batch_size) content = content.replaceAll('{{batch_size}}', args.batch_size);
 
