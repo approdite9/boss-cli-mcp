@@ -1,0 +1,346 @@
+#!/usr/bin/env node
+/**
+ * boss-mcp 的 **StreamableHTTP** 传输入口（远程 Agent 通过 Nginx 反代访问时的形态）。
+ *
+ * ## 与 stdio 入口的核心差异：多会话
+ *
+ * stdio 是一进程一客户端；HTTP 下客户端会随时断开重连，每次重连都是一次新的 `initialize`。
+ * 而 SDK 的 `Server` 内部记录初始化状态，**一个实例只能 initialize 一次**，复用它会被拒绝
+ * （"Server already initialized"）。所以这里按 `Mcp-Session-Id` 维护会话表，每次 initialize
+ * 建一套全新的 Server+Transport，互不影响。
+ *
+ * ## 为什么不能「重建单例」
+ *
+ * 历史实现是全局单例 `currentTransport` + 每次 initialize 调 `rebuildSession()`（内部
+ * `await transport.close()`）。这个做法造成过 6-14 分钟的整体假死，原因有两层：
+ *
+ * 1. **拆解操作被放在请求关键路径上。** `transport.close()` 要收掉活跃的 SSE 流，走的是
+ *    `res.end()`；当对端（公网客户端）静默消失、没发 FIN 时，终止 chunk 刷不出去，
+ *    内核开始重传退避，`close()` 就一直等。实测解除时机由 Nginx 的 `proxy_read_timeout`
+ *    决定（300s），**不是应用能控制的量级**。期间 HTTP handler 被 await 卡住，所有请求排队超时。
+ * 2. **全局单例 + 无互斥 = 竞态。** 两个 initialize 并发时，B 会关掉 A 刚建好、正在服务 A
+ *    自己的 transport，A 的响应永远不被 `end()`，挂到 TCP 超时。
+ *
+ * 因此本实现的两条硬规则：
+ * - **会话表按 id 隔离**，新会话的建立永不触碰任何已有会话；
+ * - **任何 `close()` 都不在请求路径上 await**，一律先从表里摘除、再后台异步关闭。
+ *   哪怕某个 `close()` 真卡十几分钟，也没有任何请求在等它。
+ *
+ * ## 不随会话数放宽的约束
+ *
+ * 只有协议状态（Server / Transport）按会话隔离。串行队列、调用节流、浏览器会话与
+ * `session.lock` 都是**进程级单份**——本机只有一只 Chrome。详见 `app.ts` 的 `buildServer` 注释。
+ */
+import { randomUUID } from 'node:crypto';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import {
+  buildServer,
+  installProcessSafetyNets,
+  logStartupBanner,
+  releaseSharedResources,
+} from './app.js';
+import { logAccess, logServer } from './http_log.js';
+
+// ── 配置 ──────────────────────────────────────────────────────
+
+const PORT = (() => {
+  const raw = process.env.BOSS_MCP_PORT?.trim();
+  if (!raw) return 3101;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isInteger(n) || n <= 0 || n > 65535) {
+    throw new Error(`❌ BOSS_MCP_PORT 非法: ${raw}（需为 1-65535 的整数）`);
+  }
+  return n;
+})();
+
+/**
+ * 默认只绑回环。
+ *
+ * 这个进程**自身不做任何鉴权**——Token 校验、TLS、限流全在 Nginx 上。
+ * 绑到 0.0.0.0 等于把一个无鉴权的 MCP 端点直接暴露到网络上，
+ * 任何人都能调 `boss_greet` / `pool_greet_all` 消耗真实配额。
+ * 允许覆盖是为了容器化等场景，但非回环地址会在启动时打出明确告警。
+ */
+const HOST = process.env.BOSS_MCP_HOST?.trim() || '127.0.0.1';
+
+const MCP_PATH = '/mcp';
+
+/** 请求体上限：MCP 请求都很小，给足余量即可，避免无上限读取被打爆内存。 */
+const MAX_BODY_BYTES = 4 * 1024 * 1024;
+
+/**
+ * 会话空闲回收阈值。客户端正常断开会触发 `transport.onclose` 立即摘除；
+ * 这个阈值只用于兜住「客户端静默消失、连 FIN 都没发」的会话，避免表无限增长。
+ */
+const SESSION_IDLE_MS = (() => {
+  const raw = process.env.BOSS_MCP_SESSION_IDLE_MS?.trim();
+  if (!raw) return 10 * 60_000;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isInteger(n) || n < 60_000) return 10 * 60_000;
+  return n;
+})();
+
+const REAPER_INTERVAL_MS = 60_000;
+
+/**
+ * TCP keepalive 间隔。
+ *
+ * 这是对付「对端静默消失」的**正确工具**：它能区分「空闲但活着」和「已经死了」。
+ * 单纯用 socket 空闲超时做不到这个区分——standalone GET SSE 流在没有通知要推时本来就是空闲的，
+ * 按空闲杀会把正常连接一起杀掉。keepalive 探测失败才会让 socket 出错，
+ * 从而解开任何挂在上面的写操作。
+ */
+const KEEPALIVE_MS = 30_000;
+
+// ── 会话表 ────────────────────────────────────────────────────
+
+type Session = {
+  server: Server;
+  transport: StreamableHTTPServerTransport;
+  /** 最后一次收到该会话请求的时刻，供空闲回收判断 */
+  lastSeen: number;
+};
+
+const sessions = new Map<string, Session>();
+
+/**
+ * 从表中摘除并**后台**关闭。
+ *
+ * 顺序是全部要点：`delete` 必须在 `close()` 之前，且 `close()` 绝不 await。
+ * 这样即使 `close()` 因对端消失而卡在 TCP 重传上，也没有任何请求依赖它。
+ */
+function dropSession(sessionId: string, reason: string): void {
+  const s = sessions.get(sessionId);
+  if (!s) return;
+  sessions.delete(sessionId);
+  logServer('INFO', `会话 ${sessionId} 已摘除（${reason}），剩余 ${sessions.size} 个；后台关闭中`);
+  void s.transport.close().catch(() => {});
+  void s.server.close().catch(() => {});
+}
+
+/** 空闲回收：兜住静默消失、没触发 onclose 的会话。 */
+const reaper = setInterval(() => {
+  const now = Date.now();
+  for (const [id, s] of sessions) {
+    if (now - s.lastSeen < SESSION_IDLE_MS) continue;
+    dropSession(id, `空闲超过 ${Math.round(SESSION_IDLE_MS / 1000)}s`);
+  }
+}, REAPER_INTERVAL_MS);
+reaper.unref();
+
+// ── HTTP 工具 ─────────────────────────────────────────────────
+
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(new Error(`请求体超过上限 ${MAX_BODY_BYTES} 字节`));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+function sendJsonRpcError(
+  res: ServerResponse,
+  status: number,
+  code: number,
+  message: string,
+  id: unknown = null,
+): void {
+  if (res.headersSent) {
+    res.end();
+    return;
+  }
+  res.writeHead(status, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ jsonrpc: '2.0', id: id ?? null, error: { code, message } }));
+}
+
+function sessionIdOf(req: IncomingMessage): string | undefined {
+  const raw = req.headers['mcp-session-id'];
+  const v = Array.isArray(raw) ? raw[0] : raw;
+  const trimmed = (v ?? '').trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+// ── 请求处理 ──────────────────────────────────────────────────
+
+/** 新建一套 Server+Transport 并处理这次 initialize。不触碰任何已有会话。 */
+async function handleInitialize(
+  req: IncomingMessage,
+  res: ServerResponse,
+  body: unknown,
+): Promise<void> {
+  const server = buildServer();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+    onsessioninitialized: (sessionId: string) => {
+      sessions.set(sessionId, { server, transport, lastSeen: Date.now() });
+      logServer('INFO', `新会话 ${sessionId} 就绪，当前共 ${sessions.size} 个`);
+    },
+  });
+
+  /**
+   * 客户端正常断开时摘除自己。
+   *
+   * 这里**绝不能 `process.exit`**：HTTP 下单个会话结束不代表进程该退出，
+   * 否则第一个断开的客户端就会把整个服务干掉（stdio 入口才是「传输关闭即退出」）。
+   */
+  transport.onclose = () => {
+    const id = transport.sessionId;
+    if (id && sessions.has(id)) {
+      dropSession(id, 'transport onclose');
+    }
+  };
+
+  await server.connect(transport);
+  await transport.handleRequest(req, res, body);
+}
+
+/** 每个请求一份的可变上下文；目前只用于把 JSON-RPC 方法名回传给 access log。 */
+type RequestTrace = { rpcMethod?: string };
+
+async function handleMcpRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  trace: RequestTrace,
+): Promise<void> {
+  // GET（打开 SSE 通知流）与 DELETE（显式结束会话）都不带 body
+  if (req.method === 'GET' || req.method === 'DELETE') {
+    const id = sessionIdOf(req);
+    const s = id ? sessions.get(id) : undefined;
+    if (!s) {
+      sendJsonRpcError(res, 404, -32001, '未知或已过期的会话，请重新 initialize');
+      return;
+    }
+    s.lastSeen = Date.now();
+    await s.transport.handleRequest(req, res);
+    return;
+  }
+
+  if (req.method !== 'POST') {
+    res.writeHead(405, { 'content-type': 'application/json', allow: 'GET, POST, DELETE' });
+    res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32000, message: 'Method Not Allowed' } }));
+    return;
+  }
+
+  const raw = await readBody(req);
+  let body: unknown;
+  try {
+    body = raw.length > 0 ? JSON.parse(raw) : undefined;
+  } catch {
+    sendJsonRpcError(res, 400, -32700, 'Parse error: 请求体不是合法 JSON');
+    return;
+  }
+
+  if (body && typeof body === 'object' && !Array.isArray(body)) {
+    const m = (body as { method?: unknown }).method;
+    if (typeof m === 'string') trace.rpcMethod = m;
+  }
+
+  if (isInitializeRequest(body)) {
+    await handleInitialize(req, res, body);
+    return;
+  }
+
+  const id = sessionIdOf(req);
+  if (!id) {
+    sendJsonRpcError(res, 400, -32000, '缺少 Mcp-Session-Id 请求头（非 initialize 请求必须携带）');
+    return;
+  }
+  const s = sessions.get(id);
+  if (!s) {
+    sendJsonRpcError(res, 404, -32001, '未知或已过期的会话，请重新 initialize');
+    return;
+  }
+  s.lastSeen = Date.now();
+  await s.transport.handleRequest(req, res, body);
+}
+
+// ── HTTP server ───────────────────────────────────────────────
+
+const httpServer = createServer((req, res) => {
+  const startedAt = Date.now();
+  const trace: RequestTrace = {};
+
+  // keepalive：让「静默消失的对端」在 OS 层被探测出来，而不是靠应用超时硬猜。
+  req.socket.setKeepAlive(true, KEEPALIVE_MS);
+  req.socket.setNoDelay(true);
+
+  let logged = false;
+  const logOnce = (): void => {
+    if (logged) return;
+    logged = true;
+    logAccess({
+      method: req.method ?? '-',
+      rpcMethod: trace.rpcMethod,
+      sessionId: sessionIdOf(req),
+      status: res.statusCode,
+      durationMs: Date.now() - startedAt,
+    });
+  };
+  res.on('finish', logOnce);
+  res.on('close', logOnce);
+
+  const url = req.url ?? '';
+  const path = url.split('?')[0];
+  if (path !== MCP_PATH) {
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+    return;
+  }
+
+  void handleMcpRequest(req, res, trace).catch((e: unknown) => {
+    const message = e instanceof Error ? e.message : String(e);
+    logServer('ERROR', `请求处理失败：${message}`);
+    sendJsonRpcError(res, 500, -32603, `Internal error: ${message}`);
+  });
+});
+
+// ── 生命周期 ──────────────────────────────────────────────────
+
+installProcessSafetyNets();
+
+let shuttingDown = false;
+
+async function shutdown(reason: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logServer('INFO', `正在退出（${reason}），断开 CDP 但保留浏览器窗口…`);
+
+  // 停止接受新连接；已有会话的 close 一律后台，绝不在退出路径上等 TCP。
+  httpServer.close();
+  for (const id of [...sessions.keys()]) {
+    dropSession(id, 'server shutdown');
+  }
+
+  await releaseSharedResources();
+  process.exit(0);
+}
+
+process.on('SIGINT', () => void shutdown('SIGINT'));
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+
+httpServer.listen(PORT, HOST, () => {
+  logServer('INFO', `StreamableHTTP 监听 http://${HOST}:${PORT}${MCP_PATH}`);
+  if (HOST !== '127.0.0.1' && HOST !== 'localhost' && HOST !== '::1') {
+    logServer(
+      'WARN',
+      `⚠️ 绑定地址 ${HOST} 不是回环地址。本进程自身不做任何鉴权（Token/TLS/限流都在 Nginx 上），` +
+        '这等于把一个无鉴权的 MCP 端点暴露到网络上，任何人都能调用消耗配额的工具。请确认这是有意的。',
+    );
+  }
+  logServer('INFO', `会话空闲回收阈值 ${Math.round(SESSION_IDLE_MS / 1000)}s，回收巡检 ${REAPER_INTERVAL_MS / 1000}s`);
+});
+
+await logStartupBanner('StreamableHTTP');
