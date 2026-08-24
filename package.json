@@ -55,7 +55,8 @@
     "mcp:http": "npm run build && node dist/mcp/http_server.js",
     "setup:mcp": "node scripts/setup-mcp.mjs",
     "deploy": "node scripts/deploy.mjs",
-    "test:baidu": "node --env-file=.env scripts/test-baidu-ocr.mjs"
+    "test:baidu": "node --env-file=.env scripts/test-baidu-ocr.mjs",
+    "test:aliyun": "node scripts/test-aliyun-ocr.mjs"
   },
   "engines": {
     "node": ">=20"

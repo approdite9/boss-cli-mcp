@@ -43,7 +43,10 @@ $CrashRoot   = Join-Path $LogDir 'crash'
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 
 function Write-WatchdogLog([string]$Level, [string]$Message) {
-    $line = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss.fffZ'), $Level, $Message
+    # 必须用 UTC。此前写的是本地时间却带 'Z' 后缀，与 mcp-server.log / mcp-access.log
+    # （Node 的 toISOString，真 UTC）相差 8 小时，跨文件对时间线时会被误导。
+    $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    $line = '{0} [{1}] {2}' -f $stamp, $Level, $Message
     Add-Content -Path $WatchdogLog -Value $line -Encoding UTF8
 }
 
@@ -73,7 +76,7 @@ function Save-CrashSnapshot([string]$Reason, $ServicePid) {
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
     Set-Content -Path (Join-Path $dir 'reason.txt') -Encoding UTF8 -Value @(
-        "time   : $(Get-Date -Format o)"
+        "time   : $((Get-Date).ToUniversalTime().ToString('o')) (UTC)"
         "reason : $Reason"
         "pid    : $(if ($ServicePid) { $ServicePid } else { '<not listening>' })"
     )

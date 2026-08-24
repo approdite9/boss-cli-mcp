@@ -26,7 +26,15 @@ let ocrChain: Promise<unknown> = Promise.resolve();
 
 /**
  * 对简历区域 PNG 做 OCR，将结果写入 `~/.boss-cli/.cache/ocr/`（与截图同名 `.txt`）。
- * 优先使用阿里云 OCR，回退百度 OCR。
+ *
+ * 后端选择：**配了阿里云就只用阿里云，配了百度（且没配阿里云）才用百度。**
+ *
+ * 注意这里**没有 fallback**——阿里云调用失败时不会自动切百度，而是直接把错误抛出去。
+ * 这是 `AGENTS.md`「禁止添加任何回退逻辑」的要求：静默切换后端会掩盖真实故障
+ * （欠费、时钟漂移、权限缺失），让人误以为服务正常。
+ *
+ * 因此「配了百度当备用」是无效的：只要阿里云的两个环境变量还在，百度永远不会被调用。
+ * 要切百度必须移除 `BOSS_ALIYUN_ACCESS_KEY_ID` / `BOSS_ALIYUN_ACCESS_KEY_SECRET`。
  */
 export async function ocrResumePngToTextFile(pngAbsPath: string): Promise<{ textPath: string; text: string }> {
   ensureAppDataLayout();
