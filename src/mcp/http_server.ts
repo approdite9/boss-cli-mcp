@@ -434,6 +434,31 @@ async function shutdown(reason: string): Promise<void> {
 process.on('SIGINT', () => void shutdown('SIGINT'));
 process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
+/**
+ * 监听失败必须**硬失败并给出非零退出码**。
+ *
+ * `installProcessSafetyNets()` 的 `uncaughtException` 兜底是给「请求处理中的漏网异常」用的——
+ * 长驻服务不该被一条 rejection 静默干掉。但它会连启动期的 listen 错误一起吞掉，后果很隐蔽：
+ * 服务器没起来、事件循环空了，进程随即退出，而且**退出码是 0**。于是任务计划的「失败时重启」
+ * 不触发，日志里只留下一句「exited with code 0」，看着像正常退出。
+ *
+ * 端口冲突属于配置/协调错误（通常是启动了第二个实例），和无头运行一样必须让进程起不来。
+ */
+httpServer.on('error', (err: NodeJS.ErrnoException) => {
+  if (err.code === 'EADDRINUSE') {
+    logServer(
+      'ERROR',
+      `❌ 端口 ${HOST}:${PORT} 已被占用，拒绝启动。` +
+        '通常是已经有一个 boss-mcp 实例在跑（两个实例会共用同一只 Chrome，' +
+        '并通过跨进程文件锁互相等待，表现为工具调用 30 秒后报 "session is busy"）。' +
+        `排查：netstat -ano | findstr ${PORT}`,
+    );
+  } else {
+    logServer('ERROR', `❌ HTTP 服务监听失败（${err.code ?? 'unknown'}）：${err.message}`);
+  }
+  process.exit(1);
+});
+
 httpServer.listen(PORT, HOST, () => {
   logServer('INFO', `StreamableHTTP 监听 http://${HOST}:${PORT}${MCP_PATH}`);
   logServer('INFO', `健康检查 http://${HOST}:${PORT}${HEALTH_PATH}（仅回环，勿在 Nginx 暴露）`);
