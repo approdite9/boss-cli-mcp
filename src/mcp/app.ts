@@ -330,8 +330,11 @@ const CHAT_ACTION_ALIASES: Record<string, ChatPageAction> = {
  *
  * 与 `local_guard.ts` 的 `LOCAL_ONLY_TOOLS`（判断是否需要节流）**不是同一件事**：
  * 那个问的是「碰不碰浏览器」，这里问的是「花不花真实额度」。
- * 例如 `boss_recommend` 碰浏览器但不花额度，`pool_get_detail` 传 preview=true 时才花。
- * 判定方向保守：宁可多标，也不要漏掉一个花钱的动作。
+ * 例如 `boss_recommend` 碰浏览器但不花额度。
+ *
+ * 简历类工具也列在这里：**它们是否真的扣次数取决于账号套餐**——部分套餐的在线简历
+ * 预览是无限的。审计打标刻意取保守口径（宁可多标），这样「配额被异常消耗」的排查
+ * 只需筛 `quota=yes`，不会漏。若你的账号确认无限，看审计时忽略简历类那几行即可。
  */
 const QUOTA_CONSUMING_TOOLS: ReadonlySet<string> = new Set([
   'boss_greet',
