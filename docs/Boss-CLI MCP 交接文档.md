@@ -439,8 +439,15 @@ curl --resolve boss.bowenfin.com:3100:192.168.229.106 -X POST https://boss.bowen
 | ~~P0~~ | ~~`transport.close()` 阻塞假死~~ | 已修复：会话表 + 关闭不 await（坑2） | — |
 | P1 | 阿里云 OCR 失败 | AccessKey 未配置/过期 | 更新 .env 中的 BOSS_ALIYUN_ACCESS_KEY_ID/SECRET |
 | P2 | 公网 SNI 过滤 | 出口设备拦截未知 SNI | 网管加白名单 |
-| P3 | 无 watchdog 自动恢复 | 假死后需手动重启 | 部署健康检查计划任务 |
-| P3 | 进程退出后无自动重启 | 未注册为 Windows 服务 | NSSM 服务化 |
+| ~~P3~~ | ~~无 watchdog 自动恢复~~ | 已提供 `scripts/win-service/watchdog-mcp.ps1` + `/health` 端点 | — |
+| ~~P3~~ | ~~进程退出后无自动重启~~ | 已提供任务计划方案（见下方「十四」） | — |
+
+> ⚠️ **不要按原计划做 NSSM 服务化。** Windows 服务运行在 Session 0，自 Vista 起与用户桌面
+> 完全隔离——没有桌面、没有 GPU。而有头 Chrome 是本项目的硬约束（`local_guard.ts`：整套页面
+> 守卫的成立前提是「真实机器 + 有头浏览器」，它刻意不伪造 `plugins` / `window.chrome`）。
+> 在 Session 0 里跑 Chrome 会让 WebGL renderer 退化成 SwiftShader、丢失真实交互事件历史，
+> 叠加已有 profile 就是一次「设备特征突变」的登录，直接威胁账号安全。
+> 正确做法是**自动登录 + 登录触发的隐藏任务**，见「十四」。
 
 ---
 
@@ -603,3 +610,116 @@ browserCallThrottle.afterCall()
 ---
 
 *文档结束*
+
+---
+
+## 十四、开机常驻与看门狗（Windows）
+
+### 为什么不能用 Windows 服务
+
+见「八」的告警。核心矛盾：**开机后无人登录时系统没有交互桌面，而有头 Chrome 必须有桌面。**
+Windows 服务在 Session 0，没有桌面也没有 GPU。唯一同时满足两个条件的路径是
+**自动登录建立真实会话 + 登录触发的隐藏任务**。
+
+### 相关文件
+
+| 文件 | 作用 |
+|------|------|
+| `scripts/win-service/run-mcp.cmd` | 启动脚本，输出重定向到 `logs\stdout.log` |
+| `scripts/win-service/run-mcp.vbs` | 以**隐藏窗口**调用上面的 cmd |
+| `scripts/win-service/watchdog-mcp.ps1` | 探活 → 留证 → 重启 |
+
+> 编码要求：`.ps1` 必须是 **UTF-8 with BOM**（PowerShell 5.1 否则按 GBK 读，中文注释会
+> 破坏解析）；`.cmd` / `.vbs` 保存为 **ANSI(CP936)**（cmd.exe 与 wscript 默认按 ANSI 读）。
+> 改动这些文件后务必确认编码没被编辑器改掉。
+
+### 为什么必须隐藏窗口
+
+Windows 控制台默认开启「快速编辑模式」。**只要有人在窗口里点一下或拖选文本，进程就会在下一次
+写 stdout/stderr 时被挂起**——不是崩溃、不是退出。此时 `tasklist` 有 PID、`netstat` 显示
+LISTENING，一切看着正常，但所有请求超时、应用日志停止增长。历史上多次「假死」疑似由此造成。
+
+双重防护：① 隐藏窗口（没有窗口可点）；② 输出重定向（进程根本不碰控制台）。
+
+### 一次性配置
+
+**1. 自动登录**（开机即建立交互会话）
+
+推荐用 Sysinternals `Autologon.exe`——它把密码存进 LSA secret，而不是像直接改注册表
+`Winlogon\DefaultPassword` 那样近乎明文：
+
+```cmd
+Autologon.exe bowen <域或机器名> <密码>
+```
+
+> ⚠️ 安全权衡：开启自动登录意味着任何能物理/控制台访问该机器的人都直接进入已登录桌面，
+> 而这个桌面上有已登录 Boss 的 Chrome。请确保机器本身处于受控环境。
+
+**2. 电源设置**（防止休眠把服务带走）
+
+```cmd
+powercfg /change standby-timeout-ac 0
+powercfg /change hibernate-timeout-ac 0
+powercfg /change monitor-timeout-ac 0
+```
+
+**3. 注册主任务**
+
+```cmd
+schtasks /create /tn "boss-mcp" /tr "wscript.exe \"C:\Users\bowen\boss-cli\scripts\win-service\run-mcp.vbs\"" /sc onlogon /ru bowen /rl highest /f
+```
+
+然后在 `taskschd.msc` 里打开 boss-mcp → **设置**页，必须调整两项默认值：
+
+- **取消勾选**「如果任务运行时间超过以下时间，则停止任务」（默认 3 天会杀掉长驻进程）
+- 勾选「如果任务失败，按以下频率重新启动」→ 1 分钟 / 重试 3 次
+
+笔记本还要在**条件**页取消「只有在计算机使用交流电源时才启动此任务」。
+
+**4. 注册看门狗任务**（每 2 分钟）
+
+```cmd
+schtasks /create /tn "boss-mcp-watchdog" /tr "powershell -ExecutionPolicy Bypass -NoProfile -File \"C:\Users\bowen\boss-cli\scripts\win-service\watchdog-mcp.ps1\"" /sc minute /mo 2 /ru bowen /rl highest /f
+```
+
+### 看门狗做什么
+
+**判据是一次真实 HTTP 请求，不是查进程。** 这一点是关键：本服务两类历史故障期间，
+node 进程都在、端口都还 LISTENING，`tasklist` / `netstat` 一个都抓不到。
+
+探测 `GET http://127.0.0.1:3101/health`（10s 超时）。选 `/health` 而非 `/mcp` 的原因：
+`initialize` 会在会话表里建记录，每 2 分钟一次会不断挤占 64 的会话上限，把真实客户端的
+会话按 LRU 淘汰掉。`/health` 零协议副作用，不碰浏览器、不消耗任何配额。
+
+失败处理：
+
+1. **连续失败 2 次**才动手（单次失败可能只是抖动，不该重启一个可能正在跑长任务的服务）
+2. **先留证再重启**——重启会毁掉现场。快照落在 `logs\crash\<时间戳>\`，含：
+   `reason.txt`、四份日志副本、`netstat.txt`、`node-processes.txt`、`chrome-processes.txt`。
+   后三者用于区分「进程没了」「端口没了」「都在但不响应（冻结/阻塞）」
+3. **按 PID 结束进程**，不用 `taskkill /im node.exe`（那会连带杀掉机器上其它 Node 进程）
+4. **不动 Chrome**——它是 detached 启动的，能跨 node 重启存活，登录态就在它的 profile 里。
+   杀掉它会逼用户重新扫码
+5. 等端口释放后启动，**并复验健康状态**，结果写进 `logs\watchdog.log`
+
+### 日常检查
+
+```cmd
+:: 服务是否真的活着（最可靠的一条）
+curl http://127.0.0.1:3101/health
+
+:: 看门狗动作记录
+powershell "Get-Content C:\Users\bowen\.boss-cli\logs\watchdog.log -Tail 20"
+
+:: 历史故障现场
+dir C:\Users\bowen\.boss-cli\logs\crash
+```
+
+`tasklist` / `netstat` 只能证明进程和端口存在，**不能证明服务可用**。判断服务健康请用
+`/health`。
+
+### 已知限制
+
+**RDP 断开可以，注销不行。** 「只在用户登录时运行」意味着进程活在交互会话里。
+RDP 断开连接时会话保持（disconnected 状态），Chrome 和服务继续运行；但**注销会话**
+会把两者一起带走，需要重新登录（自动登录会在下次开机时恢复）。

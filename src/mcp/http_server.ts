@@ -68,6 +68,21 @@ const HOST = process.env.BOSS_MCP_HOST?.trim() || '127.0.0.1';
 
 const MCP_PATH = '/mcp';
 
+/**
+ * 健康检查路径（仅回环，**不要**在 Nginx 里代理出去）。
+ *
+ * 为什么需要它：本服务的两类历史故障——控制台快速编辑挂起进程、以及请求路径上
+ * `await close()` 阻塞——期间进程都没有退出、端口都还在 LISTENING。也就是说
+ * 「查 PID」「查端口」这类检查**一个都抓不到**，看门狗必须发一次真实请求。
+ *
+ * 刻意不走 `/mcp`：`initialize` 会在会话表里建一条记录，看门狗每分钟探一次会不断
+ * 挤占 {@link MAX_SESSIONS}，把真实客户端的会话按 LRU 淘汰掉。这里零协议副作用，
+ * 也不碰浏览器、不消耗任何配额。
+ */
+const HEALTH_PATH = '/health';
+
+const startedAtMs = Date.now();
+
 /** 请求体上限：MCP 请求都很小，给足余量即可，避免无上限读取被打爆内存。 */
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 
@@ -362,6 +377,21 @@ const httpServer = createServer((req, res) => {
 
   const url = req.url ?? '';
   const path = url.split('?')[0];
+
+  if (path === HEALTH_PATH) {
+    // 能返回就说明事件循环没被卡住——这正是看门狗要判断的事。
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(
+      JSON.stringify({
+        status: 'ok',
+        pid: process.pid,
+        uptimeMs: Date.now() - startedAtMs,
+        sessions: sessions.size,
+      }),
+    );
+    return;
+  }
+
   if (path !== MCP_PATH) {
     res.writeHead(404, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: 'not found' }));
@@ -406,6 +436,7 @@ process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
 httpServer.listen(PORT, HOST, () => {
   logServer('INFO', `StreamableHTTP 监听 http://${HOST}:${PORT}${MCP_PATH}`);
+  logServer('INFO', `健康检查 http://${HOST}:${PORT}${HEALTH_PATH}（仅回环，勿在 Nginx 暴露）`);
   if (HOST !== '127.0.0.1' && HOST !== 'localhost' && HOST !== '::1') {
     logServer(
       'WARN',
