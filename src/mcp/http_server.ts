@@ -93,6 +93,19 @@ const SESSION_IDLE_MS = (() => {
 const REAPER_INTERVAL_MS = 60_000;
 
 /**
+ * 会话数硬上限，超出时按 `lastSeen` 摘掉最旧的。
+ *
+ * 空闲会话本身很便宜（两个小对象，不持有 socket），所以这个上限不是为了省内存，
+ * 而是给「客户端在网络抖动时反复重连、每次重连一次 initialize」这种情况一个明确上界——
+ * 否则 4 小时的保留窗口配上高频重连，表可以攒到几百条，回收巡检一次性摘除时
+ * 会做同样多次同步日志写入。
+ *
+ * 刻意用 LRU 而不是「新会话到来就清掉旧会话」：后者正是被移除的 `rebuildSession()` 的错误——
+ * 会关掉正在服务其它请求的 transport。
+ */
+const MAX_SESSIONS = 64;
+
+/**
  * TCP keepalive 间隔。
  *
  * 这是对付「对端静默消失」的**正确工具**：它能区分「空闲但活着」和「已经死了」。
@@ -126,6 +139,15 @@ function dropSession(sessionId: string, reason: string): void {
   logServer('INFO', `会话 ${sessionId} 已摘除（${reason}），剩余 ${sessions.size} 个；后台关闭中`);
   void s.transport.close().catch(() => {});
   void s.server.close().catch(() => {});
+}
+
+/** 超出上限时摘掉最久未活动的会话，保证表大小有确定上界。 */
+function evictOverflowSessions(): void {
+  if (sessions.size <= MAX_SESSIONS) return;
+  const byOldest = [...sessions.entries()].sort((a, b) => a[1].lastSeen - b[1].lastSeen);
+  for (const [id] of byOldest.slice(0, sessions.size - MAX_SESSIONS)) {
+    dropSession(id, `会话数超过上限 ${MAX_SESSIONS}，摘除最久未活动的`);
+  }
 }
 
 /** 空闲回收：兜住静默消失、没触发 onclose 的会话。 */
@@ -196,6 +218,7 @@ async function handleInitialize(
     onsessioninitialized: (sessionId: string) => {
       sessions.set(sessionId, { server, transport, lastSeen: Date.now() });
       logServer('INFO', `新会话 ${sessionId} 就绪，当前共 ${sessions.size} 个`);
+      evictOverflowSessions();
     },
   });
 
