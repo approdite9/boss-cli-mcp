@@ -726,3 +726,139 @@ dir C:\Users\bowen\.boss-cli\logs\crash
 **RDP 断开可以，注销不行。** 「只在用户登录时运行」意味着进程活在交互会话里。
 RDP 断开连接时会话保持（disconnected 状态），Chrome 和服务继续运行；但**注销会话**
 会把两者一起带走，需要重新登录（自动登录会在下次开机时恢复）。
+
+---
+
+## 十五、完整启动流程
+
+「十四」讲一次性配置，本节讲**日常运行**：开机后什么会自动发生、什么需要人工、怎么确认。
+
+### 组件的启动方式为什么不一样
+
+| 组件 | 启动方式 | 为什么 |
+|------|---------|--------|
+| **Nginx** | Windows 服务（开机自启，与登录无关） | 纯网络代理，**不需要桌面** |
+| **boss-mcp** | 任务计划「只在用户登录时运行」 | 有头 Chrome **必须有交互桌面**，服务跑在 Session 0 没有桌面 |
+| **看门狗** | 任务计划，每 2 分钟 | 与 boss-mcp 同会话，才能把它重启到有桌面的会话里 |
+| **Chrome** | 不预启动，首次工具调用时按需 spawn | detached 启动，能跨 node 重启存活；登录态在它的 profile 里 |
+
+Nginx 若还是手工 `nginx.exe -p C:\nginx\` 启动的，**重启后不会自己起来**，建议注册成服务：
+
+```cmd
+sc create nginx binPath= "C:\nginx\nginx.exe -p C:\nginx\" start= auto DisplayName= "nginx"
+sc start nginx
+```
+
+Nginx 和 boss-mcp 的启动**没有先后要求**——boss-mcp 未就绪时 Nginx 只是返回 502。
+
+### 冷启动链路
+
+```
+虚拟机开机
+  │
+  ├─ Nginx 服务自启 ──────────────────► 监听 3100（TLS + Token + 限流）
+  │
+  └─ 用户登录
+        │  ⚠️ 未配 Autologon 时，这一步需要人工 RDP 登录一次
+        │
+        ├─ 任务计划 onlogon 触发 boss-mcp
+        │     wscript run-mcp.vbs（隐藏窗口，等待子进程）
+        │       └─ cmd run-mcp.cmd（输出重定向到 stdout.log）
+        │           └─ node dist/mcp/http_server.js
+        │                 └─ 监听 127.0.0.1:3101（/mcp + /health）
+        │
+        └─ 任务计划启动看门狗（每 2 分钟探 /health）
+
+首次工具调用时
+  └─ spawn 有头 Chrome（调试端口 53470，detached）
+        └─ 从 profile 恢复 Boss 登录态
+```
+
+**首次工具调用最慢**：Chrome 冷启动 + 页面加载 + 等侧栏 `.menu-list`（最长 30s）+ 1.8-5s 节流，
+可能超过客户端超时（实测客户端约 30s）。开机后建议先在桌面上预热一次：
+
+```cmd
+cd /d C:\Users\bowen\boss-cli
+node dist\cli\index.js positions
+```
+
+这条走 CLI 不经 MCP，但用同一只 Chrome、同一个 profile。它同时验证了**登录态还在不在**。
+
+### 日常启停
+
+```cmd
+:: 停（先停看门狗，否则 2 分钟内它会把服务拉起来，你会以为没停成）
+schtasks /end /tn "boss-mcp-watchdog"
+schtasks /end /tn "boss-mcp"
+
+:: 起
+schtasks /run /tn "boss-mcp"
+schtasks /run /tn "boss-mcp-watchdog"
+
+:: 状态（Running = 正常；Ready = 没在跑）
+schtasks /query /tn "boss-mcp"
+```
+
+**不要再手工 `node dist/mcp/http_server.js`** —— 会撞端口。撞端口现在硬失败（exit 1）不会搞坏东西，
+但日志里会多出 ERROR，且任务计划的重启策略会跟着重试 3 次。
+
+### 更新代码
+
+```cmd
+schtasks /end /tn "boss-mcp-watchdog"
+schtasks /end /tn "boss-mcp"
+cd /d C:\Users\bowen\boss-cli
+git pull
+npm run build
+netstat -ano | findstr 3101      :: 必须没有输出，确认端口已释放
+schtasks /run /tn "boss-mcp"
+timeout /t 8
+curl http://127.0.0.1:3101/health
+schtasks /run /tn "boss-mcp-watchdog"
+```
+
+`npm run build` 失败就**不要继续**——旧的 `dist/` 还在，服务能起但跑的是旧代码，很容易误判。
+
+### 健康确认（按可信度排序）
+
+```cmd
+:: 1. 最可靠：服务是否真的可用
+curl http://127.0.0.1:3101/health
+
+:: 2. 经 Nginx 是否通（排除鉴权/代理问题）
+curl -k --resolve boss.bowenfin.com:3100:127.0.0.1 https://boss.bowenfin.com:3100/mcp -o NUL -w "%{http_code}\n" -X POST -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" -H "Authorization: Bearer <TOKEN>" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"1\"}}}"
+
+:: 3. Chrome 在不在（纯本地，不产生 Boss 流量）
+curl http://127.0.0.1:53470/json/version
+
+:: 4. 端到端：从客户端调 boss_list_positions（只读、零配额）
+```
+
+> `tasklist` 和 `netstat` 只能证明**进程和端口存在**，不能证明服务可用——
+> 历史上两类假死期间它们都显示正常。判断健康请用 `/health`。
+
+### 遇到问题看哪个日志
+
+| 现象 | 先看 |
+|------|------|
+| 客户端连不上 | `C:\nginx\logs\error.log` → `mcp-access.log` |
+| 工具报错 | `mcp-audit.log`（`outcome=error` + 结果摘要） |
+| 配额被异常消耗 | `mcp-audit.log` 筛 `quota=yes` |
+| 服务重启过 | `watchdog.log` + `logs\crash\<时间戳>\` |
+| 请求慢 | `mcp-access.log` 的 `handler=`（`stream=` 大是正常的） |
+| 进程莫名退出 | `mcp-server.log` 找 `未经过正常 shutdown 流程` + `stdout.log` |
+
+日志读取一律用 `Get-Content`（能识别 BOM）；用 `type` 需先 `chcp 65001`。
+
+### 当前未覆盖的场景
+
+**虚拟机无人值守重启后服务不会自启。** 触发器是 `onlogon`，且两个任务都是「只在用户登录时运行」，
+所以没人登录时**服务和看门狗都不会跑**——看门狗救不了这种情况，它自己也停着。
+配上 Autologon（「十四」）才能闭环。
+
+**RDP 注销会杀掉服务和 Chrome。** 断开连接没问题（会话保持 disconnected），
+但「注销」会销毁会话。这一条容易被顺手点错。
+
+**登录态过期是静默的。** `/health` 正常、看门狗不动，但每次工具调用都返回「未登录」。
+自检探不到（要探就得真访问 Boss，而定时自动访问本身就是风控特征）。
+靠人工节奏：每天先调一次 `boss_list_positions` 确认。
