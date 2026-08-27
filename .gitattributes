@@ -1,0 +1,15 @@
+# Windows 侧脚本必须以 CRLF 签出，否则会静默坏掉。
+#
+# 实测（本机 zh-CN，用仓库里 LF 版本的 run-mcp.cmd）：
+#   chcp 437  → 正常
+#   chcp 936  → 注释片段被当成命令执行、`set LOGDIR` 整行消失、node 拿到乱码参数，
+#               脚本以退出码 1 结束，且 stdout.log 从未创建
+#   chcp 65001→ 同样错乱
+# 原因：多字节代码页下，中文注释末字节会把紧随其后的 LF 当作尾字节吃掉，下一行被并进注释；
+# CRLF 里的 CR(0x0D) 不是合法尾字节，换行因此不会被吞。
+#
+# 这类故障随执行上下文（登录时的任务计划 vs 交互式会话）时好时坏，
+# 现场表现就是任务计划 LastTaskResult=1、日志目录里什么都没有。
+*.cmd text eol=crlf
+*.vbs text eol=crlf
+*.ps1 text eol=crlf

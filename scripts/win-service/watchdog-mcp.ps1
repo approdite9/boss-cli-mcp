@@ -81,11 +81,37 @@ function Save-CrashSnapshot([string]$Reason, $ServicePid) {
         "pid    : $(if ($ServicePid) { $ServicePid } else { '<not listening>' })"
     )
 
-    foreach ($name in 'mcp-server.log', 'mcp-access.log', 'stdout.log', 'watchdog.log') {
+    # 缺失也要显式记下来。现场遇到过一份快照里三个文件全空、stdout.log 干脆不存在，
+    # 当时无法区分「日志没复制成功」和「进程压根没写过日志」——后者才是真相
+    # （启动器在 node 之前就失败了）。把「缺哪些」写清楚，下次不用再猜。
+    $missing = @()
+    foreach ($name in 'mcp-server.log', 'mcp-access.log', 'mcp-audit.log', 'stdout.log', 'launcher.log', 'watchdog.log') {
         $src = Join-Path $LogDir $name
         if (Test-Path $src) {
             # 复制而非移动：服务日志要保持连续，别让排查手段本身制造断点
             Copy-Item $src (Join-Path $dir $name) -ErrorAction SilentlyContinue
+        } else {
+            $missing += $name
+        }
+    }
+    if ($missing.Count -gt 0) {
+        Set-Content -Path (Join-Path $dir 'missing-logs.txt') -Encoding UTF8 -Value @(
+            '快照时以下日志文件不存在（不是复制失败，是当时确实没有）：'
+            $missing
+            ''
+            'stdout.log 缺失 = 启动器没走到 node（run-mcp.cmd 里 node 的输出重定向才会创建它）；'
+            'launcher.log 有内容 = run-mcp.vbs 记下了 cmd 的退出码，先看那一行。'
+        )
+    }
+
+    # 任务计划状态：LastRunTime / LastTaskResult 能直接区分「任务没触发」「任务跑了但失败」。
+    # 这两个值不在任何日志里，而重启之后就更难对齐时间线了，所以必须当场抓。
+    foreach ($task in 'boss-mcp', 'boss-mcp-watchdog') {
+        $out = Join-Path $dir "task-$task.txt"
+        try {
+            & schtasks /query /tn $task /v /fo LIST 2>&1 | Out-File $out -Encoding UTF8
+        } catch {
+            Set-Content -Path $out -Encoding UTF8 -Value "查询任务失败：$($_.Exception.Message)"
         }
     }
 
