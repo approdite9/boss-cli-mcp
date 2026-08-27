@@ -4,7 +4,7 @@ import {
   JOB_SELECT_ACTION_GAP_MS,
   RESUME_PREVIEW_OPEN_GAP_MS,
   sleepRandom,
-  humanClickSelector,
+  humanClick,
 } from '../browser/index.js';
 import { withBossSessionPage } from '../common/boss_session_page.js';
 import { ensurePage } from '../common/ensure_page.js';
@@ -112,7 +112,8 @@ async function waitForRecommendJobDropdownReady(frame: Frame): Promise<void> {
 
 async function waitForRecommendJobSearchResults(frame: Frame, keyword: string): Promise<void> {
   await frame.waitForFunction(
-    `((kw) => {
+    `(() => {
+      const kw = ${JSON.stringify(keyword)};
       const norm = (v) => (v ?? "").replace(/\\s+/g, "").trim().toLowerCase();
       const rows = Array.from(document.querySelectorAll(".job-selecter-options .job-list .job-item"));
       if (rows.length === 0) return false;
@@ -121,21 +122,19 @@ async function waitForRecommendJobSearchResults(frame: Frame, keyword: string): 
         const label = norm(el.querySelector(".label")?.textContent || el.textContent || "");
         return label.includes(norm(kw));
       });
-    })`,
+    })()`,
     { timeout: 10_000 },
-    keyword,
   );
 }
 
 async function waitForRecommendJobSelected(frame: Frame, expectedLabel: string): Promise<void> {
   await frame.waitForFunction(
-    `((label) => {
+    `(() => {
       const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
       const current = norm(document.querySelector(".job-selecter-wrap .ui-dropmenu-label")?.textContent);
-      return !!current && current === label;
-    })`,
+      return !!current && current === ${JSON.stringify(expectedLabel)};
+    })()`,
     { timeout: 10_000 },
-    expectedLabel,
   );
   await ensureRecommendFrameReady(frame);
 }
@@ -414,18 +413,31 @@ export async function clickGreet(
       throw new Error(`候选人 ${result.name} 缺少“打招呼”按钮，无法执行。`);
     case 'disabled':
       throw new Error(`候选人 ${result.name} 已打招呼。`);
-    case 'ready_to_click':
-      // 用贝塞尔曲线鼠标移动 + 拟人点击
+    case 'ready_to_click': {
+      // 标记是打在 `recommendFrame` 这个 iframe 的文档里的，必须在**同一个 frame** 内定位。
+      // 之前用 `humanClickSelector(frame.page(), ...)`，那是在顶层 document 里 querySelector，
+      // iframe 内的按钮永远查不到，于是必然抛「元素未找到: [data-boss-greet-target="1"]」。
+      // `clickablePoint()` 会把 frame 偏移算进去，得到页面级坐标，仍可走贝塞尔拟人点击。
       const greetPage = frame.page();
-      await humanClickSelector(greetPage, '[data-boss-greet-target="1"]');
+      const btn = await frame.$('[data-boss-greet-target="1"]');
+      if (!btn) {
+        throw new Error(`候选人 ${result.name} 的“打招呼”按钮标记已失效（推荐列表可能已刷新）。`);
+      }
+      try {
+        const point = await btn.clickablePoint();
+        await humanClick(greetPage, point.x, point.y);
+      } finally {
+        await btn.dispose();
+      }
       // 清除标记
-      await frame.evaluate(() => {
+      await frame.evaluate(`(() => {
         const el = document.querySelector('[data-boss-greet-target="1"]');
-        el?.removeAttribute('data-boss-greet-target');
-      });
+        if (el) el.removeAttribute('data-boss-greet-target');
+      })()`);
       return {
         message: `已对 ${result.name} 点击“打招呼”。`,
       };
+    }
     default: {
       const _x: never = result;
       throw new Error(`未知结果：${String(_x)}`);

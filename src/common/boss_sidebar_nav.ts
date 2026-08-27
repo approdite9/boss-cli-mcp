@@ -14,8 +14,18 @@ export async function clickBossSidebarMenuToPath(
   targetPath: string,
 ): Promise<void> {
   // Step 1: 在页面中定位目标菜单项并获取其坐标
+  //
+  // 参数必须用 JSON.stringify 内联进脚本文本：puppeteer 对**字符串** pageFunction 走
+  // `Runtime.evaluate`，额外参数会被直接丢弃（见 cdp/ExecutionContext #evaluate）。
+  // 之前写成 `(({label, path}) => {...})` + 传参，实际返回的是那个未被调用的函数对象，
+  // returnByValue 序列化后得到 `{}`——非 null 于是通过了下面的判空，
+  // 再取 `.x/.y` 得到 undefined，最终以 `Input.dispatchMouseEvent ... params.x` 报错。
+  const labelLiteral = JSON.stringify(menuLabel);
+  const pathLiteral = JSON.stringify(targetPath);
   const targetBox = (await page.evaluate(
-    `(({ label, path }) => {
+    `(() => {
+      const label = ${labelLiteral};
+      const path = ${pathLiteral};
       const norm = (v) => (v ?? "").replace(/\\s+/g, "");
       const links = Array.from(document.querySelectorAll(".menu-list a"));
       const target = links.find((a) => {
@@ -35,12 +45,16 @@ export async function clickBossSidebarMenuToPath(
         x: rect.x + rect.width / 2,
         y: rect.y + rect.height / 2,
       };
-    })`,
-    { label: menuLabel, path: targetPath },
+    })()`,
   )) as { x: number; y: number } | null;
 
   if (!targetBox) {
     throw new Error(`未找到侧边栏菜单"${menuLabel}"，无法跳转到 ${targetPath}。`);
+  }
+  if (!Number.isFinite(targetBox.x) || !Number.isFinite(targetBox.y)) {
+    throw new Error(
+      `侧边栏菜单"${menuLabel}"坐标非法（x=${targetBox.x} y=${targetBox.y}），无法点击跳转到 ${targetPath}。`,
+    );
   }
 
   // Step 2: 用真实鼠标事件点击（贝塞尔曲线轨迹 + isTrusted=true）
@@ -50,16 +64,19 @@ export async function clickBossSidebarMenuToPath(
   await sleepRandom(SIDEBAR_NAV_AFTER_CLICK_MS.min, SIDEBAR_NAV_AFTER_CLICK_MS.max);
 
   // Step 3: 等待 SPA 路由切换完成
+  //
+  // 同样必须内联参数并自执行：`waitForFunction` 对字符串会包成 `() => { return (表达式); }`，
+  // 传入的参数不会到达表达式内部。写成未调用的箭头函数时，表达式的值是函数对象（恒为真），
+  // 于是这个等待会立刻「成功」——路由根本没校验过。
   await page.waitForFunction(
-    `((path) => {
+    `(() => {
       try {
         const p = window.location.pathname.replace(/\\/+$/, "") || "/";
-        return p === path;
+        return p === ${pathLiteral};
       } catch {
         return false;
       }
-    })`,
+    })()`,
     { timeout: SIDEBAR_NAV_WAIT_MS },
-    targetPath,
   );
 }
