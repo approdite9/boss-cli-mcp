@@ -1,0 +1,84 @@
+# boss-mcp 反向代理参考配置
+#
+# 部署位置：C:\nginx\conf\nginx.conf（本文件是纳入版本管理的参考副本，改动请两边同步）
+#
+# 职责分工：boss-mcp 进程**自身不做任何鉴权**，Token 校验 / TLS / 限流全在这一层。
+# 因此 boss-mcp 必须只绑回环（默认 127.0.0.1，见 src/mcp/http_server.ts 的 HOST）。
+
+worker_processes 1;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    # ⚠️ 仅排查 Token 不匹配时临时启用：这个 log_format 会把完整 Authorization 头明文写进磁盘。
+    #    排查结束后请注释掉，并轮换 Token。
+    # log_format debug_auth '$remote_addr - $time_local - "$request" '
+    #                       'status=$status auth_header="$http_authorization" '
+    #                       'ua="$http_user_agent"';
+    # access_log C:/nginx/logs/auth_debug.log debug_auth;
+
+    log_format mcp '$remote_addr - $time_local - "$request" '
+                   'status=$status upstream_time=$upstream_response_time '
+                   'ua="$http_user_agent"';
+    access_log C:/nginx/logs/mcp_access.log mcp;
+
+    map_hash_bucket_size 128;
+
+    map $http_authorization $auth_valid {
+        default 0;
+        "Bearer <TOKEN>" 1;
+    }
+
+    limit_req_zone $binary_remote_addr zone=mcp_limit:10m rate=10r/s;
+
+    server {
+        listen 3100 ssl;
+        server_name boss.bowenfin.com;
+
+        ssl_certificate     C:/nginx/ssl/bowenfin.com.crt;
+        ssl_certificate_key C:/nginx/ssl/bowenfin.com.key;
+        ssl_protocols       TLSv1.2 TLSv1.3;
+
+        location /mcp {
+            if ($auth_valid = 0) {
+                return 403;
+            }
+
+            # 限流必须在 location 里显式引用；只声明 limit_req_zone 是不生效的。
+            # 客户端超时后会重试，假死排查期间这条尤其有用。
+            limit_req zone=mcp_limit burst=20 nodelay;
+
+            proxy_pass http://127.0.0.1:3101/mcp;
+            proxy_http_version 1.1;
+
+            proxy_set_header Host              $host;
+            proxy_set_header X-Real-IP         $remote_addr;
+            proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header Connection        '';
+            proxy_set_header Accept            "application/json, text/event-stream";
+
+            # SSE 必须关闭缓冲，否则 server-initiated 通知会被 nginx 攒着，
+            # 破坏 MCP 的 progress 心跳语义（长任务会被客户端判定为卡死）。
+            #
+            # 代价：关闭缓冲后 nginx 不再解耦上下游，公网客户端卡住会直接传导为
+            # boss-mcp 侧的写阻塞。这一点在应用层已经处理——所有 transport.close()
+            # 都不在请求路径上 await（见 src/mcp/http_server.ts 的模块注释）。
+            proxy_buffering off;
+            proxy_cache off;
+            chunked_transfer_encoding on;
+
+            # 上限约束：单次工具调用的看门狗（BOSS_MCP_TOOL_TIMEOUT_MS，默认 240s）
+            # 必须小于这里的 proxy_read_timeout，否则 nginx 会先掐断连接，
+            # 客户端拿到的是连接中断而不是那条可读的超时说明。
+            proxy_read_timeout 300s;
+            proxy_send_timeout 300s;
+        }
+
+        location / {
+            return 404;
+        }
+    }
+}

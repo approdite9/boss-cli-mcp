@@ -36,6 +36,12 @@ export const RESUME_SCREENSHOTS_DIR = join(CACHE_DIR, 'resume-screenshots');
 /** 在线简历截图经 OCR 后的纯文本保存目录（与截图同名 `.txt`） */
 export const RESUME_OCR_DIR = join(CACHE_DIR, 'ocr');
 
+/**
+ * 运行日志目录（HTTP 传输下 stderr 通常没人看，必须落盘才能事后排查假死）。
+ * 刻意放在 `APP_HOME` 而不是 `CACHE_DIR` 下：日志不是缓存，清缓存时不该被一起删掉。
+ */
+export const LOGS_DIR = join(APP_HOME, 'logs');
+
 let appDataLayoutReady = false;
 
 /** 确保 `~/.boss-cli/.cache` 目录存在（幂等） */
@@ -58,6 +64,9 @@ export function ensureAppDataLayout(): void {
   }
   if (!existsSync(RESUME_OCR_DIR)) {
     mkdirSync(RESUME_OCR_DIR, { recursive: true });
+  }
+  if (!existsSync(LOGS_DIR)) {
+    mkdirSync(LOGS_DIR, { recursive: true });
   }
   const agentSkills = getAgentSkillsDir();
   if (!existsSync(agentSkills)) {
