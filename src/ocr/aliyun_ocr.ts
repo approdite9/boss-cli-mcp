@@ -208,10 +208,52 @@ function extractText(data: NonNullable<RecognizeAllTextResponse['Data']>): {
   return { text: '', granularity: '空' };
 }
 
+/** 阿里云 RecognizeAllText 的边长限制（含）。 */
+const MIN_EDGE_PX = 5;
+const MAX_EDGE_PX = 8192;
+
+/** PNG 签名 + IHDR：宽高固定在偏移 16..23（大端 4 字节各一个）。 */
+function pngDimensions(buffer: Buffer): { width: number; height: number } | null {
+  if (buffer.length < 24) return null;
+  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  if (!buffer.subarray(0, 8).equals(signature)) return null;
+  return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+}
+
+/**
+ * 上传前校验边长。
+ *
+ * 为什么不能只依赖服务端报错：越界时阿里云只回一句
+ * `416 illegalImageSize The image size must not be less than 5px or greater than 8192px`，
+ * 不含实际尺寸。线上因此攒了十几条一模一样的日志，谁都不知道那些简历到底多高、
+ * 是被 devicePixelRatio 放大的还是简历本身长——排查完全无从下手。
+ *
+ * 这里只做「把尺寸说清楚后失败」，不缩图、不跳过：图片超限的正确解法是上游按 OCR 上限分段截图
+ * （见 `common/c_resume_capture.ts`），在这一层压缩或静默跳过都只会掩盖上游的尺寸计算错误。
+ * 非 PNG（如 JPG）取不到尺寸就不校验，交由服务端判定——这是「无法校验」，不是「跳过校验」。
+ */
+function assertImageSizeWithinLimits(imageBuffer: Buffer): void {
+  const dim = pngDimensions(imageBuffer);
+  if (!dim) return;
+
+  const { width, height } = dim;
+  const tooLarge = width > MAX_EDGE_PX || height > MAX_EDGE_PX;
+  const tooSmall = width < MIN_EDGE_PX || height < MIN_EDGE_PX;
+  if (!tooLarge && !tooSmall) return;
+
+  throw new Error(
+    `图片尺寸 ${width}x${height}px 不满足阿里云 OCR 要求（边长需在 ${MIN_EDGE_PX}-${MAX_EDGE_PX}px 之间，`
+      + `本图${tooLarge ? '过大' : '过小'}，${Math.round(imageBuffer.length / 1024)}KB）。`
+      + '截图应在上游按 OCR 上限分段（common/c_resume_capture.ts），此处不做缩放或跳过。',
+  );
+}
+
 /**
  * 对整张 PNG/JPG 做通用文字识别，返回合并文本。
  */
 export async function aliyunOcrImageBuffer(imageBuffer: Buffer): Promise<string> {
+  assertImageSizeWithinLimits(imageBuffer);
+
   const akId = accessKeyId();
   const akSecret = accessKeySecret();
   if (!akId || !akSecret) {

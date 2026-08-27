@@ -19,7 +19,7 @@ import {
   waitForVisibleCResumeIframeReady,
 } from '../common/c_resume_capture.js';
 import { ensureAppDataLayout, RESUME_SCREENSHOTS_DIR } from '../config.js';
-import { isResumeOcrEnabled, ocrResumePngToTextFile } from '../ocr/index.js';
+import { isResumeOcrEnabled, ocrResumePngsToTextFile } from '../ocr/index.js';
 import { runGetCommunicationHistory } from './chat.js';
 
 type IncomingCardBtn = 'agree' | 'refuse';
@@ -383,14 +383,14 @@ async function updateCandidateRemark(page: Page, remarkText: string): Promise<st
   await page.type(textareaSel, nextRemark, { delay: 24 });
   await sleepRandom(200, 360);
 
+  // 参数内联进脚本文本：字符串 pageFunction 下 puppeteer 会丢弃额外参数，
+  // 未调用的箭头函数序列化后是 `{}`（真值），这个校验会永远「通过」。
   const filledOk = (await page.evaluate(
-    `((selector, expected) => {
-      const el = document.querySelector(selector);
+    `(() => {
+      const el = document.querySelector(${JSON.stringify(textareaSel)});
       if (!(el instanceof HTMLTextAreaElement)) return false;
-      return (el.value ?? "").trim() === expected;
-    })`,
-    textareaSel,
-    nextRemark,
+      return (el.value ?? "").trim() === ${JSON.stringify(nextRemark)};
+    })()`,
   )) as boolean;
   if (!filledOk) {
     throw new Error('备注输入未生效，请重试。');
@@ -506,7 +506,10 @@ async function getCandidateLabelForResumeShot(page: Page): Promise<string> {
  *
  * 进入前记录视口（`snapshotBossPageViewport`，见 {@link captureCResumeIframeToFile}）。
  */
-async function captureOnlineResumeScreenshot(page: Page, candidateLabel: string): Promise<string | null> {
+async function captureOnlineResumeScreenshot(
+  page: Page,
+  candidateLabel: string,
+): Promise<string[] | null> {
   ensureAppDataLayout();
 
   const savedViewport = await snapshotBossPageViewport(page);
@@ -541,12 +544,13 @@ async function captureOnlineResumeScreenshot(page: Page, candidateLabel: string)
   const fileName = `online-resume-${safeResumeScreenshotFileBase(candidateLabel)}-${Date.now()}.png`;
   const absPath = join(RESUME_SCREENSHOTS_DIR, fileName);
 
-  const ok = await captureCResumeIframeToFile(page, savedViewport, absPath);
-  if (!ok) {
+  // 长简历会被按 OCR 边长上限切成多张（`-p1.png`、`-p2.png`…）。
+  const shots = await captureCResumeIframeToFile(page, savedViewport, absPath);
+  if (shots.length === 0) {
     await closeCResumePanel(page);
     return null;
   }
-  return absPath;
+  return shots;
 }
 
 export type ChatPageAction =
@@ -571,15 +575,15 @@ export async function runChatActionOnCurrentConversation(
     case 'resume': {
       await ensureInCandidateChat(page, '在线简历');
       const candidateLabel = await getCandidateLabelForResumeShot(page);
-      const resumeShotPath = await captureOnlineResumeScreenshot(page, candidateLabel);
-      if (resumeShotPath === null) {
+      const resumeShots = await captureOnlineResumeScreenshot(page, candidateLabel);
+      if (resumeShots === null) {
         throw new Error('未找到在线简历入口，或在线简历弹层未正常出现。');
       }
       if (!isResumeOcrEnabled()) {
-        return `在线简历操作成功，截图文件：${resumeShotPath}`;
+        return `在线简历操作成功，截图文件：${resumeShots.join('、')}`;
       }
       try {
-        const ocr = await ocrResumePngToTextFile(resumeShotPath);
+        const ocr = await ocrResumePngsToTextFile(resumeShots);
         return `在线简历操作成功，\n在线简历 OCR 正文：\n\n${ocr.text}`;
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);

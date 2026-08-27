@@ -16,7 +16,7 @@ import {
   waitForVisibleCResumeIframeReady,
 } from '../common/c_resume_capture.js';
 import { ensureAppDataLayout, RESUME_SCREENSHOTS_DIR } from '../config.js';
-import { isResumeOcrEnabled, ocrResumePngToTextFile } from '../ocr/index.js';
+import { isResumeOcrEnabled, ocrResumePngsToTextFile } from '../ocr/index.js';
 import {
   ensureInDeepSearchPage,
   isBossChatAiFormUrl,
@@ -93,23 +93,28 @@ export async function runPreview(options: PreviewOptions): Promise<string> {
       const fileName = `preview-${safeResumeScreenshotFileBase(target)}-${Date.now()}.png`;
       const absPath = join(RESUME_SCREENSHOTS_DIR, fileName);
 
-      const ok = await captureCResumeIframeToFile(page, savedOriginal, absPath);
-      if (!ok) {
+      // 长简历会被按 OCR 边长上限切成多张（`-p1.png`、`-p2.png`…），这里拿到的是实际文件列表。
+      const shots = await captureCResumeIframeToFile(page, savedOriginal, absPath);
+      if (shots.length === 0) {
         await closeCResumePanel(page);
         throw new Error('在线简历 iframe 截图失败。');
       }
+      const shotLine =
+        shots.length === 1
+          ? `简历预览截图：${shots[0]}`
+          : `简历预览截图（共 ${shots.length} 段）：${shots.join('、')}`;
 
       const disclaimer =
         '说明：平台对在线简历的每日可查看次数有限，请按需使用、谨慎查看。';
 
       if (!isResumeOcrEnabled()) {
-        return [jobLine, `简历预览截图：${absPath}`, '', disclaimer].join('\n');
+        return [jobLine, shotLine, '', disclaimer].join('\n');
       }
       try {
-        const ocr = await ocrResumePngToTextFile(absPath);
+        const ocr = await ocrResumePngsToTextFile(shots);
         return [
           jobLine,
-          `简历预览截图：${absPath}`,
+          shotLine,
           '',
           '在线简历 OCR 正文：',
           '',

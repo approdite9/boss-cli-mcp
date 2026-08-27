@@ -36,8 +36,14 @@ let ocrChain: Promise<unknown> = Promise.resolve();
  * 因此「配了百度当备用」是无效的：只要阿里云的两个环境变量还在，百度永远不会被调用。
  * 要切百度必须移除 `BOSS_ALIYUN_ACCESS_KEY_ID` / `BOSS_ALIYUN_ACCESS_KEY_SECRET`。
  */
-export async function ocrResumePngToTextFile(pngAbsPath: string): Promise<{ textPath: string; text: string }> {
+export async function ocrResumePngsToTextFile(
+  pngAbsPaths: string[],
+): Promise<{ textPath: string; text: string }> {
   ensureAppDataLayout();
+
+  if (pngAbsPaths.length === 0) {
+    throw new Error('没有可 OCR 的简历截图。');
+  }
 
   // 优先阿里云，其次百度
   const useAliyun = isAliyunOcrConfigured();
@@ -52,19 +58,25 @@ export async function ocrResumePngToTextFile(pngAbsPath: string): Promise<{ text
     );
   }
 
-  const base = basename(pngAbsPath).replace(/\.png$/i, '.txt');
+  // 文本文件按第一张截图命名：长简历会被切成 `x-p1.png`、`x-p2.png`…，
+  // 但它们是同一份简历，正文必须拼成一份，不能散成多个 .txt。
+  const base = basename(pngAbsPaths[0]!)
+    .replace(/-p\d+\.png$/i, '.png')
+    .replace(/\.png$/i, '.txt');
   const textPath = join(RESUME_OCR_DIR, base);
 
   const run = async (): Promise<{ textPath: string; text: string }> => {
-    const buf = await readFile(pngAbsPath);
-    const imageBase64 = buf.toString('base64');
-
-    let text: string;
-    if (useAliyun) {
-      text = await aliyunOcrImageBase64(imageBase64);
-    } else {
-      text = await baiduOcrImageBase64(imageBase64);
+    const parts: string[] = [];
+    for (const png of pngAbsPaths) {
+      const buf = await readFile(png);
+      const imageBase64 = buf.toString('base64');
+      // 分段之间没有重叠，所以按顺序直接拼接即可；切口处可能有一行被切成两半，
+      // 那是刻意选择（重叠会产生重复的经历条目，对读简历的干扰更大）。
+      parts.push(
+        useAliyun ? await aliyunOcrImageBase64(imageBase64) : await baiduOcrImageBase64(imageBase64),
+      );
     }
+    const text = parts.join('\n');
 
     await writeFile(textPath, text.endsWith('\n') ? text : `${text}\n`, 'utf8');
     return { textPath, text };
