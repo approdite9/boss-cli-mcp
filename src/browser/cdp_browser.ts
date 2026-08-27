@@ -12,6 +12,29 @@ const CDP_WEBSOCKET_ENDPOINT_REGEX = /^DevTools listening on (ws:\/\/.*)$/;
 const LAUNCH_READY_MS = 30_000;
 
 /**
+ * 单条 CDP 命令的等待上限（puppeteer 默认 180s）。
+ *
+ * 为什么必须调小：现场遇到过 Chrome 长时间无响应（约 55 分钟后自行恢复）。默认 180s 下，
+ * 每个工具调用都要卡满 3 分钟才吐一句 `Page.addScriptToEvaluateOnNewDocument timed out`，
+ * 而 Agent 会持续重试——审计日志里 18 次失败、连带排队叠加到单次 364s，一小时全耗在等待上。
+ * 收到 60s 后同样的情况一轮只损失 1 分钟，且 MCP 单次调用看门狗（默认 240s）还能兜住。
+ *
+ * 不能设得更小：长简历整框截图本身就是一条慢 CDP 命令，几十秒是正常的。
+ * 可用 `BOSS_BROWSER_PROTOCOL_TIMEOUT_MS` 覆盖。
+ */
+const PROTOCOL_TIMEOUT_MS: number = (() => {
+  const raw = process.env.BOSS_BROWSER_PROTOCOL_TIMEOUT_MS?.trim();
+  if (raw) {
+    const n = Number.parseInt(raw, 10);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return 60_000;
+})();
+
+/** 复用已有实例前的 CDP 存活校验超时。一次 `Browser.getVersion` 往返，健康时是毫秒级。 */
+const CDP_LIVENESS_TIMEOUT_MS = 5_000;
+
+/**
  * 固定的远程调试端口：boss-cli 使用独立的 user-data-dir，因此可以稳定占用一个端口，
  * 让多个命令直接通过 `http://127.0.0.1:<port>/json/version` 复用同一只浏览器。
  * 可用 `BOSS_BROWSER_REMOTE_DEBUGGING_PORT` 覆盖。
@@ -61,6 +84,55 @@ async function probeRemoteDebuggingWsEndpoint(
     return undefined;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/**
+ * 校验刚连上的浏览器**真的能处理 CDP 命令**，不只是端口通。
+ *
+ * 为什么 `/json/version` 不够：那个 HTTP 端点由浏览器进程的独立线程伺服，
+ * 主线程/CDP 分发卡住时它照样返回 200。现场就出现过探活成功、`puppeteer.connect` 成功、
+ * `browser.connected === true`，但第一条真实命令（注入页面守卫的
+ * `Page.addScriptToEvaluateOnNewDocument`）挂满超时的情况——错误信息完全指不到根因。
+ *
+ * 这里发一条最便宜的 `Browser.getVersion`（`browser.version()`）：健康时毫秒级返回。
+ * 超时即断开连接并抛出可操作的错误，**不杀浏览器**——现场证据显示它会自行恢复，
+ * 杀掉反而会丢掉登录态、逼用户重新扫码。
+ */
+async function assertCdpResponsive(browser: Browser): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error('CDP_LIVENESS_TIMEOUT'));
+    }, CDP_LIVENESS_TIMEOUT_MS);
+  });
+
+  try {
+    await Promise.race([browser.version(), timeout]);
+  } catch (e) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const anyB = browser as any;
+      if (typeof anyB.disconnect === 'function') {
+        await Promise.resolve(anyB.disconnect());
+      }
+    } catch {
+      /* 连接本就不可用，断开失败可忽略 */
+    }
+    const raw = e instanceof Error ? e.message : String(e);
+    const reason = raw === 'CDP_LIVENESS_TIMEOUT' ? `${CDP_LIVENESS_TIMEOUT_MS}ms 内无响应` : raw;
+    throw new Error(
+      [
+        `调试端口 ${REMOTE_DEBUGGING_PORT} 上的浏览器无法处理 CDP 命令（${reason}）。`,
+        '端口能连上但命令不响应，通常是浏览器进程被内存压力/换页拖住（现场记录过持续约 55 分钟后自行恢复）。',
+        '本次调用已提前中止，未消耗任何配额；请稍后重试，或到该机器上确认 Chrome 与内存状态。',
+        '不要因为这个错误去调用登录类工具——它与登录态无关。',
+      ].join('\n'),
+    );
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
   }
 }
 
@@ -418,10 +490,13 @@ export async function connectBrowser(options: ConnectBrowserOptions = {}): Promi
    */
   const existingWsUrl = await probeRemoteDebuggingWsEndpoint(REMOTE_DEBUGGING_PORT, 800);
   if (existingWsUrl) {
-    return await puppeteer.connect({
+    const existing = await puppeteer.connect({
       browserWSEndpoint: existingWsUrl,
       defaultViewport: launchViewportFromEnv(),
+      protocolTimeout: PROTOCOL_TIMEOUT_MS,
     });
+    await assertCdpResponsive(existing);
+    return existing;
   }
 
   // 默认保留 WebAssembly：`typeof WebAssembly === 'undefined'` 本身就是强自动化指纹。
@@ -508,6 +583,7 @@ export async function connectBrowser(options: ConnectBrowserOptions = {}): Promi
     return await puppeteer.connect({
       browserWSEndpoint: wsUrl,
       defaultViewport: launchViewportFromEnv(),
+      protocolTimeout: PROTOCOL_TIMEOUT_MS,
     });
   } catch (e) {
     try {

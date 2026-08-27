@@ -15,6 +15,7 @@
  * 进程被强杀或被控制台挂起时最关键的那几行恰好会丢——那正是要看的内容。
  */
 import { appendFileSync, existsSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { freemem, totalmem } from 'node:os';
 import { join } from 'node:path';
 import { ensureAppDataLayout, LOGS_DIR } from '../config.js';
 
@@ -194,10 +195,31 @@ export type AuditRecord = {
   /** 入参；已在调用方做长度截断，避免把简历正文之类的大字段写进日志 */
   args: string;
   outcome: 'ok' | 'error';
+  /** 总时长：从收到请求到返回结果，= queueMs + execMs */
   durationMs: number;
+  /** 串行队列里的等待时长 */
+  queueMs: number;
+  /** 出队后真正执行的时长；与单次调用看门狗（BOSS_MCP_TOOL_TIMEOUT_MS）对应的是这个值 */
+  execMs: number;
   /** 结果摘要（成功时取首行，失败时取错误消息），同样已截断 */
   summary: string;
 };
+
+/**
+ * 采样内存，附在每条审计后面。
+ *
+ * 为什么值得记：远端机器只有 5GB，而这个服务会临时把视口拉到 5000px 给长简历整框截图，
+ * 单张位图就能到几十 MB。现场出现过 Chrome 连续约 55 分钟无法处理 CDP 命令后自行恢复
+ * ——「自行恢复」这个形态最像内存压力/换页，而不是死锁，但当时没有任何内存数据可查，
+ * 只能停在猜测。每条审计一个采样，成本可忽略，下次同样的故障就能直接定性。
+ *
+ * 注意 `os.freemem()` 是**整机**空闲内存（含 Chrome 的占用），`rss` 只是本 node 进程；
+ * 两个一起看才能区分「是我们涨上去了」还是「整机被别人吃满了」。
+ */
+function memorySample(): string {
+  const mb = (bytes: number): string => `${Math.round(bytes / 1024 / 1024)}MB`;
+  return `rss=${mb(process.memoryUsage().rss)} free=${mb(freemem())}/${mb(totalmem())}`;
+}
 
 /**
  * 工具调用审计。
@@ -207,6 +229,9 @@ export type AuditRecord = {
  * 花了多少额度」，这条线索不能和几千行 HTTP 请求混在一起。
  *
  * `quota=yes` 的行就是花掉真实额度的动作，排查配额异常消耗时直接筛这一个字段。
+ *
+ * 时长记三个值（`duration` = `queue` + `exec`）：只记总时长时，「排在前面的调用超时 180s」
+ * 会被读成「本次调用自己跑了 364s」，从而误判单次调用看门狗失效。看门狗管的是 `exec`。
  */
 export function logAudit(rec: AuditRecord): void {
   write(
@@ -217,6 +242,9 @@ export function logAudit(rec: AuditRecord): void {
       `quota=${rec.consumesQuota ? 'yes' : 'no'}`,
       `outcome=${rec.outcome}`,
       `duration=${rec.durationMs}ms`,
+      `queue=${rec.queueMs}ms`,
+      `exec=${rec.execMs}ms`,
+      memorySample(),
       `args=${rec.args}`,
       `result=${rec.summary}`,
     ].join(' '),

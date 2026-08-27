@@ -140,7 +140,43 @@ export function rewriteSessionBusyMessage(message: string): string | null {
     .join('\n');
 }
 
+/**
+ * puppeteer 在目标 frame 被卸载时抛的原文特征。
+ * 典型场景：读推荐列表途中，当前标签被导航到别的页面（`recommendFrame` 随之消失）。
+ */
+function isDetachedFrameMessage(message: string): boolean {
+  return (
+    message.includes('frame got detached') ||
+    message.includes('Attempted to use detached Frame') ||
+    message.includes('Execution context was destroyed')
+  );
+}
+
+/**
+ * 把「frame 已卸载」改写成可操作指引，并**显式劝阻调用登录工具**。
+ *
+ * 为什么要专门写这一句：审计日志里出现过自我强化的失败循环——
+ * `boss_recommend` 报 `frame got detached`，Agent 判断成「可能未登录」于是调 `boss_login`，
+ * 而 `boss_login` 会把当前标签导航到登录页，把推荐列表彻底弄掉，下一次 `boss_recommend`
+ * 必然再次 detached。原始英文错误里没有任何信息能让 Agent 避开这个坑。
+ */
+export function rewriteDetachedFrameMessage(message: string): string | null {
+  if (!isDetachedFrameMessage(message)) {
+    return null;
+  }
+  return [
+    '❌ 目标页面在操作过程中被导航或刷新，当前列表上下文已失效，本次调用未完成。',
+    '',
+    '这与登录态无关，**不要因此调用 boss_login**——它会把当前标签导航到登录页，',
+    '反而让推荐/搜索列表彻底丢失，下一次读取仍会失败。',
+    '',
+    '推荐列表是易失的：一旦页面被导航走，本轮筛选需要重新开始（重新读取列表，不要沿用旧序号）。',
+    '',
+    `（原始信息：${message}）`,
+  ].join('\n');
+}
+
 /** 统一的错误文案增强入口：命中已知模式就改写，否则原样返回 */
 export function enhanceToolErrorMessage(message: string): string {
-  return rewriteSessionBusyMessage(message) ?? message;
+  return rewriteSessionBusyMessage(message) ?? rewriteDetachedFrameMessage(message) ?? message;
 }

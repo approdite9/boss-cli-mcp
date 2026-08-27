@@ -375,7 +375,10 @@ const TOOL_SPECS: ToolSpec[] = [
       '执行 Boss 直聘登录。有头模式下打开浏览器窗口让用户扫码（立即返回不等待）；' +
       '无头模式（BOSS_BROWSER_HEADLESS=true）下截图二维码并轮询等待扫码完成，' +
       '返回结果中包含 qrcodePath（截图路径）和 qrcodeBase64（图片 base64），' +
-      '请将二维码图片发送给用户扫码。等待最长 5 分钟，超时需重新调用。',
+      '请将二维码图片发送给用户扫码。等待最长 5 分钟，超时需重新调用。' +
+      '⚠️ 副作用：会把**当前标签**导航到登录页，正在进行的推荐/搜索列表会因此丢失，' +
+      '本轮筛选必须重新开始。仅在用户明确要求登录时调用；' +
+      '不要用它来「试探」登录态，也不要在其它工具报错后拿它当恢复手段。',
     annotations: { title: '打开登录页', readOnlyHint: false, openWorldHint: true },
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
     run: async () => implLogin(),
@@ -1121,8 +1124,13 @@ export function buildServer(): Server {
     };
 
     const auditStartedAt = Date.now();
-    const result = await serialize(() =>
-      runToolCall({
+    // 出队时刻：`auditStartedAt` 到这里是排队等待，之后才是真正执行。
+    // 分开记的原因：审计里只有一个总时长时，「前面那个调用超时 180s」会被读成
+    // 「本次调用自己跑了 364s」，进而误判成单次调用看门狗（240s）失效——现场就误判过一次。
+    let execStartedAt = auditStartedAt;
+    const result = await serialize(() => {
+      execStartedAt = Date.now();
+      return runToolCall({
         toolName,
         signal: extra.signal,
         tick,
@@ -1148,15 +1156,18 @@ export function buildServer(): Server {
             browserCallThrottle.afterCall(toolName);
           }
         },
-      }),
-    );
+      });
+    });
 
+    const finishedAt = Date.now();
     logAudit({
       toolName,
       consumesQuota: QUOTA_CONSUMING_TOOLS.has(toolName),
       args: summarizeForAudit(JSON.stringify(args)),
       outcome: result.isError === true ? 'error' : 'ok',
-      durationMs: Date.now() - auditStartedAt,
+      durationMs: finishedAt - auditStartedAt,
+      queueMs: execStartedAt - auditStartedAt,
+      execMs: finishedAt - execStartedAt,
       summary: summarizeForAudit(firstTextOf(result)),
     });
 
