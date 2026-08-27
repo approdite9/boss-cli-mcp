@@ -48,6 +48,8 @@
     "LICENSE"
   ],
   "scripts": {
+    "check:blank": "node scripts/check-blank-padding.mjs",
+    "prebuild": "node scripts/check-blank-padding.mjs",
     "build": "tsc",
     "prepare": "npm run build",
     "dev": "npm run build && node dist/cli/index.js",
