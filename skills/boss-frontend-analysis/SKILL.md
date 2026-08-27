@@ -24,13 +24,18 @@ node skills/boss-frontend-analysis/scripts/capture_boss_frontend.mjs [--date YYY
 - `analysis.md`: 版本变化、高风险脚本说明、代码修改建议
 - `raw/`: 原始脚本文件（用于 diff）
 
-### 2. DOM Selector 健康检测 (`check_dom_selectors.mjs`) 🆕
+### 2. DOM Selector 健康检测 (`check_dom_selectors.mjs`)
 
-连接 boss-cli 已打开的浏览器，只读检测 `recommend.ts` 中所有 selector 是否仍然有效。
+连接 boss-cli 已打开的浏览器，只读检测 `recommend.ts`（推荐页）与 `list.ts` / `chat.ts`（沟通页）
+里的 selector 是否仍然有效。需 Node >= 22（用内置 WebSocket），且**必须在跑 boss-mcp 的那台机器上执行**。
 
 ```bash
-# 基本检测（输出报告到终端）
+# 基本检测（auto：优先推荐页，其次沟通页）
 node skills/boss-frontend-analysis/scripts/check_dom_selectors.mjs
+
+# 指定查哪个页面
+node skills/boss-frontend-analysis/scripts/check_dom_selectors.mjs --page chat
+node skills/boss-frontend-analysis/scripts/check_dom_selectors.mjs --page recommend
 
 # 保存结构快照（供后续 diff）
 node skills/boss-frontend-analysis/scripts/check_dom_selectors.mjs --snapshot
@@ -41,6 +46,14 @@ node skills/boss-frontend-analysis/scripts/check_dom_selectors.mjs --diff
 # 指定调试端口（默认 53470）
 node skills/boss-frontend-analysis/scripts/check_dom_selectors.mjs --port 53470
 ```
+
+**判定规则**（避免假红）：
+
+- selector 按页面分组，只对「当前页面适用」的那一组判死活；另一组标 ⏭️ 跳过、不计入退出码
+- 「按状态才出现」的元素（`hasViewed` / `emptyWorkExp` / 沟通记录弹窗 / 未读角标）标 ℹ️，缺失不算失效
+- **逐卡统计「打招呼」按钮**：只看全局数量会掩盖「某个候选人这张卡没有按钮」——
+  报告会列出没有按钮的卡片，并给出按钮区里实际的 class 与文案，用来区分
+  「业务状态（如「继续沟通」）」和「结构变了（按钮区为空或整块缺失）」
 
 **✅ 安全等级: 极高（零风险）**
 
@@ -55,15 +68,17 @@ node skills/boss-frontend-analysis/scripts/check_dom_selectors.mjs --port 53470
 
 **前提条件**: boss-cli 浏览器已启动且推荐页已加载（运行过 `boss_recommend` 即可）。
 
-**输出**:
-- 终端彩色报告: 每个 selector 的存活状态
-- `docs/research/dom-snapshots/<date>/snapshot.json`: 完整数据
-- `docs/research/dom-snapshots/<date>/classes.txt`: class 名列表（便于 diff）
-- `docs/research/dom-snapshots/<date>/report.txt`: 可读报告
+**输出**（`docs/research/dom-snapshots/<date>/`，加 `--snapshot` 时）:
+- `snapshot.json`: 完整数据（含逐卡按钮统计）
+- `classes.txt`: class 名列表（便于 diff）
+- `report.txt`: 可读报告
+- `card.html`: 第一张推荐卡片的 outerHTML
+- `card-missing-greet.html`: 没有「打招呼」按钮的那张卡（存在时才写）
+- `chat-row.html`: 聊天列表首行的 outerHTML（存在时才写）
 
 **退出码**:
-- `0`: 所有 selector 正常
-- `2`: 有候选人卡片但 selector 失效（需要更新 recommend.ts）
+- `0`: 当前页面适用的 selector 全部正常
+- `2`: 当前页面适用的 selector 有失效（需要更新 `recommend.ts` / `list.ts` / `chat.ts`）
 
 ## Workflow（完整检测流程）
 
@@ -96,7 +111,9 @@ node skills/boss-frontend-analysis/scripts/check_dom_selectors.mjs --port 53470
 
 ## 监控的 Selector 清单
 
-以下 selector 来自 `src/toolset/recommend.ts`，是 boss-cli 推荐功能的关键依赖：
+完整清单在脚本的 `SELECTOR_GROUPS` 里，改 selector 时两边要同步。
+
+推荐页（`src/toolset/recommend.ts`）关键项：
 
 | 字段 | Selector | 用途 |
 |------|----------|------|
@@ -109,7 +126,19 @@ node skills/boss-frontend-analysis/scripts/check_dom_selectors.mjs --port 53470
 | workExps | `.col-3 .timeline-wrap.work-exps .timeline-item` | 工作经历 |
 | eduWrap | `.edu-wrap` | 教育经历 |
 | greetBtn | `.button-chat-wrap .btn.btn-greet` | 打招呼按钮 |
+| buttonArea | `.button-chat-wrap` | 按钮区（判断按钮缺失是状态还是结构） |
 | jobSelector | `.job-selecter-wrap .ui-dropmenu-label` | 岗位切换 |
+
+沟通页（`src/toolset/list.ts` + `src/toolset/chat.ts`）关键项：
+
+| 字段 | Selector | 用途 |
+|------|----------|------|
+| rowWrap / row | `.geek-item-wrap` / `.geek-item` | 聊天列表行（定位与点击目标） |
+| rowName | `.geek-name` | 候选人姓名（`boss_open_chat` 按姓名查找） |
+| sourceJob / pushText / rowTime | `.source-job` / `.push-text` / `.time` | 行内信息 |
+| unreadBadge | `.badge-count` | 未读角标 |
+| detailContainer / detailName | `.base-info-single-container` / `.name-box` | 右侧详情与姓名校验 |
+| historyPanel / historyRecord | `.chat-history-process` / `.record` | 沟通记录弹窗（打开后才存在） |
 
 ## Policy（安全策略）
 
