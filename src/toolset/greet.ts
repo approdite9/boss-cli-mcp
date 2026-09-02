@@ -3,7 +3,6 @@ import {
   resumeHeight,
   setTempHeight,
   sleepRandom,
-  snapshotBossPageViewport,
 } from '../browser/index.js';
 import { closeBossModalIfPresent, waitAndCloseBossModalIfPresent } from '../common/boss_modal.js';
 import {
@@ -22,6 +21,7 @@ import {
 } from './deep-search.js';
 import {
   clickGreet,
+  assertGreetTookEffect,
   assertRecommendPageReady,
   markGreetProduced,
   readRecommendList,
@@ -55,6 +55,11 @@ async function cleanupGreetModalIfPresent(page: Page): Promise<void> {
 export type GreetOptions = {
   candidateTarget: string;
   jobKeyword?: string;
+  /**
+   * 平台身份（推荐页卡片的 `data-geekid`）。传了就只按它定位，姓名只用于错误文案。
+   * 只对推荐页生效——深度搜索列表不暴露 geekId，那条路径只能按姓名点。
+   */
+  expectGeekId?: string;
 };
 
 export async function runRecommendGreet(options: GreetOptions): Promise<string> {
@@ -68,6 +73,14 @@ export async function runRecommendGreet(options: GreetOptions): Promise<string> 
       await closeBossModalIfPresent(page);
       const url = page.url();
       if (isBossChatAiFormUrl(url)) {
+        // 深度搜索列表不暴露 geekId，这里没法按身份定位。调用方既然给了 geekId，
+        // 就说明它要求「精确到这个人」——静默改回按姓名点正是要消除的风险，所以直接拒绝。
+        if ((options.expectGeekId ?? '').trim()) {
+          throw new Error(
+            '当前在深度搜索页，该页的候选人列表不提供 geekId，无法按 geekId 精确定位。'
+              + '若要按身份打招呼，请先用 boss_recommend 进入推荐页。',
+          );
+        }
         await ensureInDeepSearchPage(page);
         let jobLine = '';
         if (kw) {
@@ -91,23 +104,25 @@ export async function runRecommendGreet(options: GreetOptions): Promise<string> 
       const frame = await assertRecommendPageReady(page, '打招呼');
       const selectedJob = await selectRecommendJob(frame, kw);
       const jobLine = selectedJob ? `当前岗位：${selectedJob}` : '当前岗位：默认';
-      const savedViewport = await snapshotBossPageViewport(page);
       try {
-        await setTempHeight(page, savedViewport, RECOMMEND_GREET_EXPAND_HEIGHT_PX);
+        // 只拉高，不动宽度与 dsf（见 setTempHeight 注释里的放大事故）
+        await setTempHeight(page, RECOMMEND_GREET_EXPAND_HEIGHT_PX);
         await sleepRandom(
           RECOMMEND_GREET_EXPAND_SETTLE_MS.min,
           RECOMMEND_GREET_EXPAND_SETTLE_MS.max,
         );
         const before = await readRecommendList(frame);
-        const greetResult = await clickGreet(frame, t);
+        const greetResult = await clickGreet(frame, t, options.expectGeekId);
         await assertNoGreetPaywallPopup(page);
         await sleepRandom(380, 1000);
         const after = await readRecommendList(frame);
+        // 必须排在 paywall 判定之后：否则付费墙拦截会被误报成「点击未生效」。
+        assertGreetTookEffect(after, greetResult);
         markGreetProduced(before, after);
         await cleanupGreetModalIfPresent(page);
         return [jobLine, greetResult.message, '', '当前推荐列表（来源分组）：', renderRecommendList(after)].join('\n');
       } finally {
-        await resumeHeight(page, savedViewport);
+        await resumeHeight(page);
       }
     }, { ensureChatShell: false, ensureMenuList: false });
   } catch (e) {

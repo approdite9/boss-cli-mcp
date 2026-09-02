@@ -232,7 +232,9 @@ export async function captureCResumeIframeToFile(
   absPath: string,
 ): Promise<string[]> {
   try {
-    await setTempHeight(page, preOpenViewport);
+    // 只拉高，不动宽度与 dsf。`preOpenViewport` 仍用于下面的 OCR 边长换算：
+    // 因为不再覆盖 dsf，它拿到的就是真实设备像素比。
+    await setTempHeight(page);
     await waitForVisibleCResumeIframeReady(page, 2_000);
 
     const iframe = await findVisibleCResumeIframeHandle(page);
@@ -307,6 +309,6 @@ export async function captureCResumeIframeToFile(
     await closeCResumePanel(page);
     return written;
   } finally {
-    await resumeHeight(page, preOpenViewport);
+    await resumeHeight(page);
   }
 }

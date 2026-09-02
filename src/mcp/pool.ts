@@ -19,6 +19,17 @@ export const POOL_DIR = join(CACHE_DIR, 'pool');
 export interface PoolCandidate {
   id: number;
   name: string;
+  /**
+   * 平台侧候选人 ID（推荐页卡片 `.card-inner[data-geekid]`）。**跨会话稳定的唯一身份**。
+   *
+   * 为什么要存：`id` 只是集合内序号，`name` 会撞、会有子串关系（「李响」是「李响东」的子串）。
+   * 打招呼时要按姓名去 DOM 里重新找卡片，一旦本人已经不在当前列表、而另一个人的姓名包含它，
+   * 就会把配额花在没筛过的人身上，且事后校验查不出来（校验用的是实际点中那张卡的 geekId）。
+   * 存下 geekId 后，打招呼按 geekId 精确定位，人不在就报「未找到」，绝不会张冠李戴。
+   *
+   * 可选：深度搜索列表（`DeepSearchGeekItem`）不暴露 geekId，那条路径来源的候选人只有姓名。
+   */
+  geekId?: string;
   matchReason?: string;
   tag?: string;
   greeted: boolean;
@@ -138,6 +149,7 @@ function normalizePool(raw: unknown, job: string): Pool {
     candidates.push({
       id,
       name,
+      geekId: optText(c.geekId),
       matchReason: optText(c.matchReason),
       tag: optText(c.tag) ?? '',
       greeted: c.greeted === true,
@@ -220,7 +232,7 @@ export type PoolAddResult = {
  */
 export async function poolAdd(
   job: string,
-  incoming: Array<{ name: string; matchReason?: string }>,
+  incoming: Array<{ name: string; matchReason?: string; geekId?: string }>,
   criteria?: Partial<PoolCriteria>,
 ): Promise<PoolAddResult> {
   const now = new Date().toISOString();
@@ -243,12 +255,18 @@ export async function poolAdd(
   for (const raw of incoming) {
     const name = (raw?.name ?? '').trim();
     if (!name) continue;
+    const geekId = (raw.geekId ?? '').trim() || undefined;
     const existing = byName.get(name);
     if (existing) {
-      // 已在集合里：只补齐缺失的匹配理由，不覆盖人工编辑过的内容
+      // 已在集合里：只补齐缺失的字段，不覆盖人工编辑过的内容。
+      // geekId 同理——补空可以，改写不行：已有的 geekId 才是当初真正筛过的那个人，
+      // 若这次传来的 geekId 不同，说明是同名的另一个人，覆盖会把身份悄悄换掉。
       const reason = (raw.matchReason ?? '').trim();
       if (reason && !existing.matchReason) {
         existing.matchReason = reason;
+      }
+      if (geekId && !existing.geekId) {
+        existing.geekId = geekId;
       }
       duplicated.push(name);
       continue;
@@ -256,6 +274,7 @@ export async function poolAdd(
     const c: PoolCandidate = {
       id: nextId++,
       name,
+      geekId,
       matchReason: (raw.matchReason ?? '').trim() || undefined,
       tag: '',
       greeted: false,
@@ -316,6 +335,15 @@ export function renderPool(pool: Pool): string {
   if (total === 0) {
     lines.push('', '（集合为空）');
     return lines.join('\n');
+  }
+  // 没有 geekId 的人只能按姓名回查卡片，撞名/子串场景会被拦下而不是猜——这里如实提示，
+  // 免得用户以为「打招呼失败」是工具坏了。
+  const withoutGeekId = pool.candidates.filter((c) => !c.geekId);
+  if (withoutGeekId.length > 0) {
+    lines.push(
+      `⚠️ 其中 ${withoutGeekId.length} 人没有 geekId（${withoutGeekId.map((c) => c.name).join('、')}），`
+        + '打招呼时只能按姓名精确匹配；若当前列表里没有同名的人会直接报错，不会退化成模糊匹配。',
+    );
   }
   lines.push('', ...pool.candidates.map(renderCandidateLine));
   const failed = pool.candidates.filter((c) => !c.greeted && c.lastError);
@@ -465,6 +493,7 @@ export function renderCandidateDetail(pool: Pool, c: PoolCandidate): string {
     `标记：${c.tag || '（无）'}`,
     `打招呼：${c.greeted ? `已打招呼${c.greetedAt ? `（${c.greetedAt}）` : ''}` : '未打招呼'}`,
   ];
+  lines.push(`geekId：${c.geekId ?? '（无——打招呼将按姓名精确匹配）'}`);
   if (c.matchReason) {
     lines.push(`匹配理由：${c.matchReason}`);
   }

@@ -13,7 +13,7 @@ import { runBossSearch, runBossSearchSet } from './deep-search.js';
 import { runNormalSearch } from './normal-search.js';
 import { runRecommend } from './recommend.js';
 import { runPreview } from './preview.js';
-import { runRecommendGreet } from './greet.js';
+import { runRecommendGreet, type GreetOptions } from './greet.js';
 export type { ChatPageAction };
 export type { DeepSearchGeekItem } from './deep-search.js';
 
@@ -116,10 +116,9 @@ export async function implPreview(opts: {
   return runPreview(opts);
 }
 
-export async function implRecommendGreet(opts: {
-  candidateTarget: string;
-  jobKeyword?: string;
-}): Promise<string> {
+// 直接复用 GreetOptions，不再在这里重抄一份字段：原先是内联字面量类型，
+// greet.ts 加了 expectGeekId 之后这层没同步，调用方传新字段会被 TS 拒绝。
+export async function implRecommendGreet(opts: GreetOptions): Promise<string> {
   return runRecommendGreet(opts);
 }
 

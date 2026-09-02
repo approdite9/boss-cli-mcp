@@ -253,17 +253,17 @@ function requireIdList(args: Record<string, unknown>, key: string, tool: string)
   return Array.from(new Set(ids));
 }
 
-/** pool_add 的 candidates：[{name, matchReason?}]，也容忍纯字符串数组 */
+/** pool_add 的 candidates：[{name, geekId?, matchReason?}]，也容忍纯字符串数组 */
 function requireCandidateList(
   args: Record<string, unknown>,
   key: string,
   tool: string,
-): Array<{ name: string; matchReason?: string }> {
+): Array<{ name: string; matchReason?: string; geekId?: string }> {
   const raw = args[key];
   if (!Array.isArray(raw)) {
-    throw new Error(`❌ ${tool} 参数 ${key} 必须是数组：[{ name, matchReason? }]`);
+    throw new Error(`❌ ${tool} 参数 ${key} 必须是数组：[{ name, geekId?, matchReason? }]`);
   }
-  const out: Array<{ name: string; matchReason?: string }> = [];
+  const out: Array<{ name: string; matchReason?: string; geekId?: string }> = [];
   for (const item of raw) {
     if (typeof item === 'string') {
       const name = item.trim();
@@ -275,7 +275,8 @@ function requireCandidateList(
       const name = typeof obj.name === 'string' ? obj.name.trim() : '';
       if (!name) continue;
       const reason = typeof obj.matchReason === 'string' ? obj.matchReason.trim() : '';
-      out.push({ name, matchReason: reason || undefined });
+      const geekId = typeof obj.geekId === 'string' ? obj.geekId.trim() : '';
+      out.push({ name, matchReason: reason || undefined, geekId: geekId || undefined });
     }
   }
   if (out.length === 0) {
@@ -598,12 +599,20 @@ const TOOL_SPECS: ToolSpec[] = [
     description:
       '⚠️【消耗平台打招呼次数，单次成本高，务必先与用户确认】对**当前列表中**的候选人点击「打招呼」。' +
       '前置条件：当前必须已在「推荐」(/web/chat/recommend) 或「深度搜索」(/web/chat/aiform) 且列表已加载，本工具不会自动跳转。' +
-      '可传 job 先在岗位下拉里模糊匹配并切换岗位。',
+      '可传 job 先在岗位下拉里模糊匹配并切换岗位。' +
+      '建议同时传 geekId（推荐页 boss_recommend 输出里每人一行）：传了就按平台身份精确定位，' +
+      '不会因为同名或姓名相近而打错人；不传则按**精确**姓名匹配，匹配不到会直接报错而不是模糊猜。',
     annotations: { title: '打招呼（消耗配额）', readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         name: { type: 'string', description: '候选人姓名（须存在于当前列表）' },
+        geekId: {
+          type: 'string',
+          description:
+            '可选但强烈建议：平台候选人 ID，从 boss_recommend 输出的 “geekId: xxx” 原样复制。'
+            + '传了则只按它定位，姓名仅用于错误文案。深度搜索页不支持该参数。',
+        },
         job: { type: 'string', description: '可选：岗位关键字，先切换岗位' },
       },
       required: ['name'],
@@ -613,6 +622,7 @@ const TOOL_SPECS: ToolSpec[] = [
       implRecommendGreet({
         candidateTarget: requireString(args, 'name', 'boss_greet'),
         jobKeyword: optString(args, 'job'),
+        expectGeekId: optString(args, 'geekId'),
       }),
   },
   {
@@ -667,7 +677,10 @@ const TOOL_SPECS: ToolSpec[] = [
     description:
       '把候选人存入指定岗位的候选人集合（按姓名去重，自动分配 1-based id）。不消耗任何配额。' +
       '典型用法：boss_deep_search_match / boss_recommend / boss_search 返回列表后，由你挑出合适的人调本工具入库；' +
-      'matchReason 建议写清为什么匹配，方便用户后续审核。core/bonus 可选，用于把这次的筛选条件一起记进集合。',
+      'matchReason 建议写清为什么匹配，方便用户后续审核。core/bonus 可选，用于把这次的筛选条件一起记进集合。' +
+      '⚠️ 来源是 boss_recommend 时**必须**把列表里每人的 geekId 一起传进来：' +
+      '后续 pool_greet_all 会按 geekId 精确定位候选人；只有姓名的话，等到打招呼时列表可能已经换了一批，' +
+      '按姓名回查有可能落到同名或姓名相近的另一个人身上。',
     annotations: { title: '集合：加入候选人', readOnlyHint: false, openWorldHint: false },
     inputSchema: {
       type: 'object',
@@ -680,6 +693,12 @@ const TOOL_SPECS: ToolSpec[] = [
             type: 'object',
             properties: {
               name: { type: 'string', description: '候选人姓名（须与 Boss 列表中显示的一致）' },
+              geekId: {
+                type: 'string',
+                description:
+                  '平台候选人 ID，从 boss_recommend 输出的每人 “geekId: xxx” 一行原样复制。'
+                  + '推荐页来源必填；深度搜索列表不提供该字段，可省略。',
+              },
               matchReason: { type: 'string', description: '匹配理由，便于用户审核' },
             },
             required: ['name'],

@@ -5,6 +5,9 @@
  * 这里只描述「打招呼」这个动作本身的特殊之处：
  * - jobKeyword 只在**第一个**候选人时传入。`runRecommendGreet` 每次带 jobKeyword 都会重新切换岗位，
  *   而在深度搜索页切岗位会重置匹配结果列表，批量场景下会把后续候选人全部弄丢。
+ * - 有 geekId 就带上 geekId（`expectGeekId`），让定位落在平台身份而不是姓名上。
+ *   没有 geekId 的候选人（深搜来源、或本功能上线前入库的）仍按精确姓名定位，
+ *   匹配不到会直接报错，不会退化成模糊匹配。
  * - greet 的原始输出会把整个推荐/深搜列表 dump 出来，批量时必须压成一行。
  */
 import { implRecommendGreet } from '../toolset/index.js';
@@ -50,6 +53,9 @@ export async function greetAll(options: GreetAllOptions): Promise<string> {
         candidateTarget: candidate.name,
         // 只有第一个才切岗位，避免重复切换把匹配结果列表重置掉
         jobKeyword: isFirst ? options.jobKeyword : undefined,
+        // 集合里存了 geekId 就按身份定位。批量打招呼是「筛选」与「执行」之间隔了几十分钟的场景，
+        // 推荐列表这期间很可能已经换过一批，只靠姓名回查最容易打到同名/近名的另一个人。
+        expectGeekId: candidate.geekId,
       }),
     onSuccess: (candidate) => {
       candidate.greeted = true;
