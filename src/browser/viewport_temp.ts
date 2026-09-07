@@ -84,14 +84,54 @@ export async function setTempHeight(page: Page, heightPx?: number): Promise<void
   // 幂等：上一轮若因异常没释放干净，先释放，避免会话越堆越多
   await resumeHeight(page);
 
+  const target = resolvedTempHeightPx(heightPx);
   const client = await page.createCDPSession();
   tempHeightSessions.set(page, client);
   await client.send('Emulation.setDeviceMetricsOverride', {
     width: 0,
-    height: resolvedTempHeightPx(heightPx),
+    height: target,
     deviceScaleFactor: 0,
     mobile: false,
   });
+
+  // CDP 命令返回 ≠ 页面已按新视口重新布局。必须等 `innerHeight` 真的变过来，
+  // 否则紧接着的截图会拍到「按旧视口布局、只画了顶部一小块」的画面。
+  //
+  // 这一步是上一版漏掉的：改用裸 CDP 之前走的是 `page.setViewport()`，
+  // puppeteer 内部会处理视口变更的生效；换成裸 CDP 后立即返回，中间的等待没了。
+  // 后果是在线简历截图从 09-03 起大面积变成「顶部有内容 + 中间空白 + 底部残帧」，
+  // OCR 字符数从日均 ~2400 掉到 ~600，而全链路没有任何一处报错。
+  await waitForViewportHeight(page, target);
+}
+
+/** 视口高度生效的等待上限；正常在一两帧内就到位。 */
+const VIEWPORT_SETTLE_TIMEOUT_MS = 3_000;
+const VIEWPORT_SETTLE_POLL_MS = 60;
+
+/**
+ * 等到页面自己看到的 `innerHeight` 达到目标高度，再额外等一帧绘制。
+ *
+ * 不达标也不抛错：视口高度本身不是业务正确性的一部分，真正会因此失败的是截图，
+ * 那里有自己的校验。这里只把「没等到」如实记下来，便于事后对齐时间线。
+ */
+async function waitForViewportHeight(page: Page, target: number): Promise<void> {
+  const deadline = Date.now() + VIEWPORT_SETTLE_TIMEOUT_MS;
+  let seen = 0;
+  while (Date.now() < deadline) {
+    seen = (await page.evaluate('(() => window.innerHeight)()')) as number;
+    if (typeof seen === 'number' && seen >= target) {
+      // 布局已按新视口跑完，再等两帧让合成器把新暴露的区域画出来。
+      await page.evaluate(`(() => new Promise((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve(true)));
+      }))()`);
+      return;
+    }
+    await new Promise((r) => setTimeout(r, VIEWPORT_SETTLE_POLL_MS));
+  }
+  console.error(
+    `[boss-cli] 临时视口高度未在 ${VIEWPORT_SETTLE_TIMEOUT_MS}ms 内生效：目标 ${target}px，实测 ${seen}px。`
+      + '接下来的截图可能不完整。',
+  );
 }
 
 /**

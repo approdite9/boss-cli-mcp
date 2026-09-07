@@ -68,6 +68,37 @@ export async function frameHasVisibleCResumeIframe(frame: Frame): Promise<boolea
 const OCR_MAX_EDGE_PX = 8192;
 
 /**
+ * CAPTURE_FROM_SURFACE_NOTE — 这里**不能**改用 `fromSurface: false`，已实测验证过。
+ *
+ * 曾经的猜想：`fromSurface` 默认 true，即从操作系统窗口表面取图；本项目是有头浏览器且常挂在
+ * 远程桌面里，RDP 断开或窗口被遮挡时表面不重绘，于是截到残帧。看起来 `fromSurface: false`
+ * （从渲染器合成）能绕开这个问题。
+ *
+ * 实测结果：它和 `captureBeyondViewport: true` **互斥**。`fromSurface: false` 只能截当前视图，
+ * 截不到视口以外的区域，于是 clip 被钳制到视图内——截出来是主页面左侧导航栏那一块
+ * （1920x879px，而 iframe 实际是 css 778x1262），OCR 正文变成「BOSS直聘/职位管理/推荐牛人…」。
+ *
+ * 长简历必须靠 `captureBeyondViewport` 才能一次截全，所以这里保留默认的 `fromSurface: true`。
+ * 残帧问题的真正成因是视口拉高后没等布局与绘制落定，已在 `setTempHeight` 里修（见其注释）。
+ */
+
+/**
+ * PNG_DENSITY_NOTE — 日志里记录「字节/像素」，只报数字不做判定。
+ *
+ * PNG 无损压缩，大片纯色会把体积压得极低，所以这个密度能反映图里有多少实际内容。
+ * 线上实测：内容铺满的健康截图约 0.20~0.27；09-03 那批残帧（顶部有内容 + 中间空白 +
+ * 底部重复开头）约 0.04~0.09。当时全链路 outcome 都是 ok、没有任何一处报错，
+ * 只能靠人工打开 PNG 才发现——有这个数字，一次 grep 就能看出那种断崖。
+ *
+ * 刻意**不设阈值告警**：试过「密度 < 0.12 即告警」，秦浩那份完整正确的短简历
+ * （973x1578px、密度 0.106）被误报——应届生简历内容少，面板却有最小高度，
+ * 底部留白是正常的。也试过用「内容填充率」把两者区分开，但 `document.scrollHeight`
+ * 等于 frame 高度（body 撑满容器）量不出真实内容范围，改量「最后一个有文字叶子节点的底边」
+ * 在实测中拿不到值。可靠的空白检测需要真正解码像素，那是独立的一件事。
+ * 在那之前，这里只负责把数字如实记下来，不做会误报的判断。
+ */
+
+/**
  * 记录刚落盘的截图实际像素尺寸、字节数与 DPR。
  *
  * 为什么需要：长简历会让整框截图超过 OCR 的 8192px 边长上限，线上只能看到阿里云回的
@@ -100,12 +131,15 @@ function logCapturedPngMetrics(absPath: string, deviceScaleFactor: number | unde
   const height = head.readUInt32BE(20);
   const dpr = deviceScaleFactor ?? 1;
   const over = width > OCR_MAX_EDGE_PX || height > OCR_MAX_EDGE_PX;
+  // 见 PNG_DENSITY_NOTE：只报数字，不设阈值告警（试过，会把正常的短简历误报）。
+  const density = width > 0 && height > 0 ? bytes / (width * height) : 0;
 
   console.error(
     [
       `[boss-cli] 简历截图 ${width}x${height}px`,
       `${Math.round(bytes / 1024)}KB`,
       `dpr=${dpr}`,
+      `密度=${density.toFixed(3)}B/px`,
       absPath,
       over ? `⚠️ 超过 OCR 边长上限 ${OCR_MAX_EDGE_PX}px，本张 OCR 会被阿里云拒绝` : '',
     ]
@@ -208,6 +242,8 @@ export async function waitForVisibleCResumeIframeReady(
 function slicePath(absPath: string, index: number): string {
   return absPath.replace(/\.png$/i, `-p${index}.png`);
 }
+
+
 
 /**
  * 在已出现 `c-resume` iframe 的页面上截图并关闭弹层，返回实际生成的文件路径（空数组=失败）。
