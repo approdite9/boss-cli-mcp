@@ -80,6 +80,64 @@ node skills/boss-frontend-analysis/scripts/check_dom_selectors.mjs --port 53470
 - `0`: 当前页面适用的 selector 全部正常
 - `2`: 当前页面适用的 selector 有失效（需要更新 `recommend.ts` / `list.ts` / `chat.ts`）
 
+### 3. 锚点看守 / 定时检测 + 候选推导 (`selector_watch.mjs`)
+
+无人值守版本。与上面第 2 个脚本的**唯一**安全差别：它**会自己开一个新标签并导航**到要检查的
+页面，检查完关掉——因为定时任务不能假设某个页面正好开着。上一版靠「当前页面」判定，
+结果职位管理页从来没被检查过，而真正坏掉的恰好就是它。
+
+```bash
+# 采基线（务必在代码已验证可用时采，这是整套机制的判定依据）
+node skills/boss-frontend-analysis/scripts/selector_watch.mjs --baseline
+
+# 日常检测（定时任务跑的就是这个）
+node skills/boss-frontend-analysis/scripts/selector_watch.mjs --check
+
+# 用今天已确认失效的旧选择器自测整条链路
+node skills/boss-frontend-analysis/scripts/selector_watch.mjs --check --selftest row
+node skills/boss-frontend-analysis/scripts/selector_watch.mjs --check --selftest field
+
+# 允许自动改常量（默认不开；定时任务也不传）
+node skills/boss-frontend-analysis/scripts/selector_watch.mjs --check --apply
+```
+
+**判定分级**（在 `REGISTRY` 里逐锚点声明，四项缺一不可）：
+
+| 字段 | 含义 |
+|------|------|
+| `kind` | `structural-oracle`（页面自带计数可交叉校验）/ `value-baseline`（靠复现基线值证明等价）/ `shape-only`（只能校验形状，够检测不够自动修） |
+| `usage` | `read` / `read+click` / `click`。**必须按实际调用点审计填写**，不能按文件或函数名想当然 |
+| `autofix` | 是否允许自动改。`usage` 含 `click` 的一律 `false` |
+| `constName` | 源码里对应的选择器常量。没有就只能报告——改 `evaluate` 字符串里的内联字面量等于对源码做正则替换，不做 |
+
+**自动更新的四个前提，缺一不可**：白名单允许 + 调用点纯读 + 候选唯一 + 候选完全复现基线。
+指向同一批元素的不同拼法（`.base-label` / `div.base-label` / `.job-labels .base-label`）
+会归并成一条并记下别名，不算歧义；只有指向**不同元素集**的候选才算真歧义，那种情况交给人。
+
+**级联折叠**：行容器失效时，行内锚点的 `found=0` 是级联结果而不是独立故障，报告里标 `cascade`
+且不计入失效数。不折叠的话一次行容器改名会报出 7 条失效，真因被噪声埋掉。
+
+**日志**（字段固定，便于长期累积分析）：
+- `~/.boss-cli/logs/selector-watch.jsonl` — 每锚点一条，关键三字段分开记：
+  `triggered`（是否触发）/ `acquired`（是否真正推出可用候选）/ `updated`（是否真正落地更新）。
+  混成一个「成功/失败」就看不出瓶颈在哪一环，也无法判断这套机制值不值得继续投入。
+- `~/.boss-cli/logs/selector-watch/<run>.txt` — 人读报告
+- `~/.boss-cli/logs/selector-watch/cron.log` — 定时任务的 stdout
+
+**基线**：`docs/research/selector-watch/baseline/<page>.json`。
+`structuralOnly` 的页面（推荐页）**一律不存值**——卡片文本是真实候选人的姓名、年龄、
+期望薪资、工作经历摘要，属于第三方个人信息，不能进仓库；而那页只做结构不变量断言，本来也用不到值。
+
+**两个内置保护**：
+- 审计日志 10 分钟内有写入就跳过本轮（`--ignore-busy` 可绕过）。同一个 Chrome 上并发两个
+  CDP 客户端会把 boss-mcp 持有的连接搞坏，之后每次调用十几毫秒内失败且不自愈，只能重启服务。
+- 落到登录页就报「无法检测」而不是「锚点失效」。分不清这两者的监控会天天误报，误报几次就没人看了。
+
+**定时任务**：`run_selector_watch.cmd`（ASCII-only + CRLF，原因见 `.gitattributes`），
+已在 108 注册为 `boss-selector-watch`，每日 03:30，只跑 `--check`，不传 `--apply`。
+
+**退出码**: `0` 全部正常 / `2` 有锚点失效 / `3` 本轮跳过（忙、未登录、浏览器不可用）/ `1` 脚本自身出错
+
 ## Workflow（完整检测流程）
 
 ### A. 日常维护（推荐频率：每周一次或 Boss 更新后）

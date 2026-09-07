@@ -1,0 +1,46 @@
+{
+  "page": "recommend",
+  "ts": "2026-09-07T09:13:03.702Z",
+  "url": "https://www.zhipin.com/web/frame/recommend/?jobid=272a635998f06e020nJ-09m7FVZX&status=0&filterParams=&t=&inspectFilterGuide=&version=11308&source=0",
+  "pageCount": null,
+  "rowCount": 15,
+  "anchors": {
+    "cardAnchor": {
+      "selector": ".card-inner[data-geekid]",
+      "kind": "structural-oracle",
+      "found": 15,
+      "values": null,
+      "perRowCount": null
+    },
+    "cardWrap": {
+      "selector": ".candidate-card-wrap",
+      "kind": "structural-oracle",
+      "found": 15,
+      "values": null,
+      "perRowCount": null
+    },
+    "greetBtn": {
+      "selector": ".button-chat-wrap .btn.btn-greet",
+      "kind": "shape-only",
+      "found": 15,
+      "values": null,
+      "perRowCount": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ]
+    }
+  }
+}
