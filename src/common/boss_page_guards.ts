@@ -419,13 +419,35 @@ const pagesWithRequestGuard = new WeakSet<Page>();
 const PAGE_GUARD_STEP_TIMEOUT_MS = 15_000;
 
 /**
+ * 单步注入超时专用的错误类型。
+ *
+ * 为什么需要一个类型而不是普通 Error：下面有两处 `catch` 是为**预期内的失败**写的
+ * （当前文档还没建执行上下文、某些 Chrome 版本不认 `window-management` 权限名），
+ * 它们不能连「渲染进程僵死」一起吞掉——僵死是必须往上抛的故障，吞掉它等于
+ * 每一步各白等 15 秒后继续，把本该 15 秒的可行动报错拖成几十秒的无声等待。
+ *
+ * 判据只能是「是否超时」，不能是错误文案：上下文没建好时 `page.evaluate` 是**立刻 reject**
+ * （`Execution context was destroyed` / `Cannot find context with specified id`），
+ * 而僵死是**永不 settle**。两者在时间维度上截然不同，用类型把这个区分固定下来。
+ */
+class PageGuardStepTimeoutError extends Error {
+  constructor(
+    message: string,
+    readonly step: string,
+    readonly pageUrl: string,
+  ) {
+    super(message);
+    this.name = 'PageGuardStepTimeoutError';
+  }
+}
+
+/**
  * 给单步注入套超时，并把「哪一步、哪个页面」写进错误信息。
  *
  * 注意：race 不会取消底层的 CDP 命令，它仍然挂在那里。这里要的不是取消，而是
  * **快速失败并指明现场**——把 60 秒的无信息等待换成 15 秒的可行动报错。
  */
 async function withGuardStepTimeout<T>(step: string, page: Page, task: Promise<T>): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
   const url = (() => {
     try {
       return page.url() || '(about:blank)';
@@ -433,15 +455,23 @@ async function withGuardStepTimeout<T>(step: string, page: Page, task: Promise<T
       return '(url 不可读)';
     }
   })();
+  return withGuardStep(step, url, task);
+}
+
+/** 与 {@link withGuardStepTimeout} 相同，但用于还没有 `Page` 对象的场合（attach 本身）。 */
+async function withGuardStep<T>(step: string, url: string, task: Promise<T>): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
   try {
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         reject(
-          new Error(
+          new PageGuardStepTimeoutError(
             `页面防护注入卡住：${step} 在 ${PAGE_GUARD_STEP_TIMEOUT_MS}ms 内没有返回。` +
               `卡住的页面：${url}。` +
               `这是该标签的渲染进程僵死，不是前端改版——CDP 命令在这种情况下不报错、只是永远不返回。` +
               `处理办法：新开一个标签并关掉这个卡住的标签（浏览器和登录态都不用动），或重启浏览器。`,
+            step,
+            url,
           ),
         );
       }, PAGE_GUARD_STEP_TIMEOUT_MS);
@@ -468,8 +498,14 @@ async function ensurePageInitGuard(page: Page): Promise<void> {
   // 当前文档已在加载中或已加载完成时，evaluateOnNewDocument 不会回溯执行；
   // 这里对当前主 frame 直接注入一次，让幂等的 try/catch 守卫立即生效。
   await withGuardStepTimeout('Runtime.evaluate（对当前文档补注入）', page, page.evaluate(script)).catch(
-    () => {
-      /* 当前文档可能还没创建执行上下文，由后续 navigation 触发 evaluateOnNewDocument 即可 */
+    (e: unknown) => {
+      // 超时必须往上抛：这个 catch 只为「当前文档还没创建执行上下文」而写（那种情况是立刻
+      // reject，由后续 navigation 触发 evaluateOnNewDocument 即可），而僵死是永不返回。
+      // 原先无条件 `catch {}` 把僵死也吞了：本步白等 15 秒且一声不响，故障被推迟到下一步
+      // 才抛，实际耗时翻倍。同时也不再丢掉原因——原因是这一路都在要求的东西。
+      if (e instanceof PageGuardStepTimeoutError) throw e;
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[boss-cli] 对当前文档补注入未生效（不影响后续 navigation 注入）：${msg}`);
     },
   );
   pagesWithInitGuard.add(page);
@@ -558,6 +594,11 @@ export async function installBossPageGuards(page: Page): Promise<void> {
   await withGuardStepTimeout('行为增强注入', page, installBehaviorEnhancements(page));
 
   // 自动拒绝所有权限弹窗（"访问此设备上的其他应用和服务"等）
+  //
+  // 这一段的失败大多是预期内的（`window-management` 这个权限名并非所有 Chrome 版本都认），
+  // 所以不让它挡住主流程；但**超时不属于这一类**：能让 `Target.attachToTarget` 或
+  // 浏览器域的 `Browser.setPermission` 挂住 15 秒的只有僵死，那必须抛出去，
+  // 否则它会被这里的 `catch` 静默吃掉，只剩「工具莫名慢了 15 秒」这个无从下手的现象。
   try {
     const cdp = await withGuardStepTimeout('Target.attachToTarget（权限设置）', page, page.createCDPSession());
     await withGuardStepTimeout(
@@ -567,15 +608,40 @@ export async function installBossPageGuards(page: Page): Promise<void> {
         permission: { name: 'window-management' },
         setting: 'denied',
       }),
-    ).catch(() => {});
+    ).catch((e: unknown) => {
+      if (e instanceof PageGuardStepTimeoutError) throw e;
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[boss-cli] 权限拒绝设置未生效（不影响主流程）：${msg}`);
+    });
     await cdp.detach().catch(() => {});
-  } catch { /* ignore - 不影响主流程 */ }
+  } catch (e) {
+    if (e instanceof PageGuardStepTimeoutError) throw e;
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(`[boss-cli] 权限设置阶段失败（不影响主流程）：${msg}`);
+  }
+}
+
+/**
+ * 把一个 target 变成 `Page`，并给这个动作套上和注入同一套超时。
+ *
+ * 为什么 attach 也必须限时：`target.page()` 第一次调用时 puppeteer 会 attach 该 target 并
+ * 初始化 Page（内部会发 `Page.enable` / `Runtime.enable` / `Network.enable`）。目标的渲染进程
+ * 僵死时这些命令**不返回**，于是 attach 本身就挂到 protocolTimeout（本仓库 60s）。
+ * 日志里 3 次 `Network.enable timed out` 就是这条路径——`Network.enable` 不是任何一个防护步骤
+ * 发的（防护发的是 `Network.setCacheDisabled` 和 `Fetch.enable`），只可能来自 puppeteer 的 attach。
+ *
+ * 导出给 `boss_session_page.ts` 用：选会话页时也要 attach，同一个坑不该踩两遍。
+ */
+export async function attachPageForTarget(target: Target): Promise<Page | null> {
+  const page = await withGuardStep('Target.attachToTarget（附着标签）', target.url(), target.page());
+  if (!page || page.isClosed()) return null;
+  return page;
 }
 
 async function installTargetPageGuards(target: Target): Promise<void> {
   if (target.type() !== 'page') return;
-  const page = await target.page();
-  if (!page || page.isClosed()) return;
+  const page = await attachPageForTarget(target);
+  if (!page) return;
   await installBossPageGuards(page);
 }
 
@@ -597,17 +663,23 @@ export async function installBossBrowserPageGuards(browser: Browser): Promise<vo
   // 它带来的风控风险本就趋近于零，却会因为这一遍 await 把所有工具一起拖死——今天现场就是
   // 这个形态（读列表正常、任何需要新建 Page 的操作白等 60 秒失败）。
   // 注意这不是「失败静默降级」：失败页面的 URL 会被点名，操作者据此关掉它即可。
-  const pages = (await browser.pages()).filter((p) => !p.isClosed());
+  //
+  // 用 `browser.targets()` 而不是 `browser.pages()`：后者会在返回前把**每个**标签都 attach 并
+  // 初始化 Page，任何一个标签僵死都会让这一句挂到 protocolTimeout（60s），
+  // 于是「逐个标签容错」这个设计根本轮不到生效——故障发生在进入循环之前。
+  // `targets()` 只读本地已有的 target 表，不发任何 CDP 命令；attach 挪进循环里逐个限时，
+  // 一个僵死标签的代价从「拖死整次调用 60 秒」变成「它自己那一格 15 秒并被点名跳过」。
+  // 这个结论此前已在 selector_watch.mjs 里得出过一次，当时没有回灌到服务端。
+  const targets = browser.targets().filter((t) => t.type() === 'page');
   const failed: string[] = [];
-  for (const page of pages) {
+  for (const target of targets) {
+    const url = target.url() || '(about:blank)';
     try {
+      const page = await attachPageForTarget(target);
+      if (!page) continue;
       await installBossPageGuards(page);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      let url = '(url 不可读)';
-      try {
-        url = page.url() || '(about:blank)';
-      } catch { /* 页面可能已不可用 */ }
       failed.push(url);
       console.error(`[boss-cli] 标签防护安装失败（已跳过该标签，不影响其它标签）：${url} —— ${msg}`);
     }

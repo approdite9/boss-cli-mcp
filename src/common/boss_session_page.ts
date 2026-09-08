@@ -2,7 +2,7 @@
  * Boss B 端「主壳」会话：选页、必要时进入沟通页、侧栏 `.menu-list` 探测，
  * 再执行 {@link withBossSessionPage} 回调。与 `src/toolset/chat.ts`（按姓名打开会话等业务）无关。
  */
-import type { Browser, Page } from 'puppeteer-core';
+import type { Browser, Page, Target } from 'puppeteer-core';
 import { BOSS_CHAT_INDEX_URL, isBossChatShellUrl } from './auth.js';
 import {
   ensureBrowserSession,
@@ -12,7 +12,7 @@ import {
 } from '../browser/browser_session.js';
 import { CONTEXT_DESTROY_RETRY_MS } from '../browser/human_delay.js';
 import { sleepRandom } from '../browser/timing.js';
-import { installBossPageGuards } from './boss_page_guards.js';
+import { attachPageForTarget, installBossPageGuards } from './boss_page_guards.js';
 import { withBossSessionLock } from './boss_session_lock.js';
 
 const SHOULD_DISABLE_JS =
@@ -21,31 +21,42 @@ const SHOULD_DISABLE_JS =
 /** Boss 为 SPA：`load` 后侧栏可能尚未挂载，需单独等待 `.menu-list` 出现 */
 const MENU_LIST_MOUNT_TIMEOUT_MS = 30_000;
 
+/**
+ * 从浏览器已有标签里挑一个当会话页。
+ *
+ * 用 `browser.targets()` 而不是 `browser.pages()`：`pages()` 会把**每个**标签都 attach 并初始化
+ * Page（内部发 `Page.enable` / `Runtime.enable` / `Network.enable`），任何一个标签的渲染进程僵死
+ * 都会让这一句挂到 protocolTimeout（本仓库 60s），哪怕僵死的那个根本不是我们要选的标签。
+ * `targets()` 只读本地 target 表，`target.url()` 也不需要 attach——所以可以先按 URL 选定，
+ * 再只对选中的那一个 attach，且 attach 本身有 15s 上限（见 `attachPageForTarget`）。
+ *
+ * 注意这里刻意不做「僵死就换下一个」：选中的标签僵死时工具就该失败。
+ * 这个函数只保证「不为了看 URL 而去 attach 无关标签」。
+ */
 async function pickExistingPage(browser: Browser): Promise<Page | null> {
-  const pages = (await browser.pages()).filter((p) => !p.isClosed());
-  if (pages.length === 0) return null;
+  const targets = browser.targets().filter((t) => t.type() === 'page');
+  if (targets.length === 0) return null;
 
-  const urls = await Promise.all(
-    pages.map((p) => {
-      try {
-        return p.url();
-      } catch {
-        return '';
-      }
-    }),
-  );
+  const urlOf = (t: Target): string => {
+    try {
+      return t.url();
+    } catch {
+      return '';
+    }
+  };
 
-  const zhipin = pages.find((p, i) => {
-    const u = urls[i] ?? '';
+  const zhipin = targets.find((t) => {
+    const u = urlOf(t);
     return u.length > 0 && u !== 'about:blank' && u.includes('zhipin.com');
   });
-  if (zhipin) return zhipin;
-
-  const nonBlank = pages.find((p, i) => {
-    const u = urls[i] ?? '';
+  const nonBlank = targets.find((t) => {
+    const u = urlOf(t);
     return u.length > 0 && u !== 'about:blank';
   });
-  return nonBlank ?? null;
+
+  const chosen = zhipin ?? nonBlank;
+  if (!chosen) return null;
+  return attachPageForTarget(chosen);
 }
 
 type MenuListSnapshot = {

@@ -1,7 +1,31 @@
 import type { ChildProcess } from 'node:child_process';
-import type { Browser, Page } from 'puppeteer-core';
+import type { Browser, Page, Target } from 'puppeteer-core';
 import { clearSpawnedChromeProcessRef, connectBrowser } from './cdp_browser.js';
-import { installBossBrowserPageGuards, installBossPageGuards } from '../common/boss_page_guards.js';
+import {
+  attachPageForTarget,
+  installBossBrowserPageGuards,
+  installBossPageGuards,
+} from '../common/boss_page_guards.js';
+
+/**
+ * 读一个 target 的 URL。
+ *
+ * 这里用 `Target` 而不是 `Page`，是因为 `browser.pages()` 为了给出 `Page` 会把**每个**标签
+ * attach 并初始化（内部发 `Page.enable` / `Runtime.enable` / `Network.enable`），
+ * 只要有一个标签的渲染进程僵死，这一句就挂到 protocolTimeout（本仓库 60s）——
+ * 而下面这几个函数其实只需要 URL 就能做决策。`targets()` 与 `target.url()` 都不发 CDP 命令。
+ */
+function targetUrl(t: Target): string {
+  try {
+    return t.url();
+  } catch {
+    return '';
+  }
+}
+
+function pageTargets(b: Browser): Target[] {
+  return b.targets().filter((t) => t.type() === 'page');
+}
 let browserRef: Browser | null = null;
 let pageRef: Page | null = null;
 let connectPromise: Promise<void> | null = null;
@@ -23,72 +47,65 @@ function attachDisconnectedHandler(b: Browser): void {
  * 而第一个是 `about:blank` 或残留空页时，错误地读到 blank 会让登录/页面检查类操作误判。
  */
 async function pickOrCreatePage(b: Browser): Promise<Page> {
-  const pages = (await b.pages()).filter((p) => !p.isClosed());
-  if (pages.length === 0) {
+  const targets = pageTargets(b);
+  if (targets.length === 0) {
     return b.newPage();
   }
 
-  const urls = await Promise.all(
-    pages.map((p) => {
-      try {
-        return p.url();
-      } catch {
-        return '';
-      }
-    }),
-  );
-
-  const zhipin = pages.find((p, i) => {
-    const u = urls[i] ?? '';
+  const zhipin = targets.find((t) => {
+    const u = targetUrl(t);
     return u.length > 0 && u !== 'about:blank' && u.includes('zhipin.com');
   });
-  if (zhipin) {
-    return zhipin;
-  }
-
-  const nonBlank = pages.find((p, i) => {
-    const u = urls[i] ?? '';
+  const nonBlank = targets.find((t) => {
+    const u = targetUrl(t);
     return u.length > 0 && u !== 'about:blank';
   });
-  if (nonBlank) {
-    return nonBlank;
-  }
 
-  return pages[0]!;
+  // 先按 URL 选定，再只对选中的那一个 attach。选中的标签若僵死，attach 会在 15s 内
+  // 带着页面 URL 报错——这正是应该发生的：工作页僵死时工具必须失败。
+  const chosen = zhipin ?? nonBlank ?? targets[0]!;
+  const page = await attachPageForTarget(chosen);
+  if (page) {
+    return page;
+  }
+  // attach 成功但页面已关闭（选定与 attach 之间标签被关掉）。这不是降级，是重新选一次。
+  return b.newPage();
 }
 
 async function closeRedundantBlankPages(b: Browser, keep: Page | null): Promise<void> {
-  const pages = (await b.pages()).filter((p) => !p.isClosed());
-  if (pages.length <= 1) return;
+  const targets = pageTargets(b);
+  if (targets.length <= 1) return;
 
-  const urls = await Promise.all(
-    pages.map((p) => {
-      try {
-        return p.url();
-      } catch {
-        return '';
-      }
-    }),
-  );
-
-  const blankPages = pages.filter((_, i) => {
-    const u = urls[i] ?? '';
+  const blanks = targets.filter((t) => {
+    const u = targetUrl(t);
     return u === '' || u === 'about:blank';
   });
-  if (blankPages.length === 0) return;
+  if (blanks.length === 0) return;
 
-  const hasNonBlank = pages.some((_, i) => {
-    const u = urls[i] ?? '';
+  const hasNonBlank = targets.some((t) => {
+    const u = targetUrl(t);
     return u !== '' && u !== 'about:blank';
   });
-
-  for (const p of blankPages) {
-    if (p === keep) continue;
-    if (!hasNonBlank && p === blankPages[0]) continue;
+  const keepTarget = (() => {
     try {
-      await p.close({ runBeforeUnload: false });
+      return keep ? keep.target() : null;
     } catch {
-      /* ignore */
+      return null;
+    }
+  })();
+
+  // 只对**准备关掉的空白页**做 attach。空白页不跑 Boss 的页面脚本，不会被页面 JS 堵死；
+  // 若连它都 attach 不上，说明僵死的是浏览器本身而不是某个渲染进程，这条日志值得留下。
+  for (const t of blanks) {
+    if (keepTarget && t === keepTarget) continue;
+    if (!hasNonBlank && t === blanks[0]) continue;
+    try {
+      const page = await attachPageForTarget(t);
+      if (!page) continue;
+      await page.close({ runBeforeUnload: false });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[boss-cli] 清理空白标签失败（已跳过）：${targetUrl(t) || '(about:blank)'} —— ${msg}`);
     }
   }
 }
@@ -141,8 +158,12 @@ export async function ensureBrowserSession(): Promise<void> {
           }
         }
         await closeRedundantBlankPages(browserRef, pageRef);
-      } catch {
-        /* ignore */
+      } catch (e) {
+        // 这一段是整理工作（当前页是空白时换一个、关掉多余空白页），失败不该挡住工具：
+        // 真正要用的 pageRef 紧接着会单独装一次防护，那一次失败才该让工具失败。
+        // 但原因必须留下——这里能失败的原因之一正是 attach 卡在僵死标签上 15s。
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error(`[boss-cli] 会话页整理失败（不影响本次调用）：${msg}`);
       }
       await installBossPageGuards(pageRef);
       return;
