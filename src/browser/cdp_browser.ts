@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import puppeteer, { type Browser, type CDPSession, type Page } from 'puppeteer-core';
 import { BROWSER_USER_DATA_DIR, ensureAppDataLayout } from '../config.js';
+import { captureIncident } from '../common/incident.js';
 
 /** 与 @puppeteer/browsers 一致，解析 Chrome 启动日志中的 CDP WebSocket URL（可能在 stdout 或 stderr）。 */
 const CDP_WEBSOCKET_ENDPOINT_REGEX = /^DevTools listening on (ws:\/\/.*)$/;
@@ -121,6 +122,8 @@ async function assertCdpResponsive(browser: Browser): Promise<void> {
     }
     const raw = e instanceof Error ? e.message : String(e);
     const reason = raw === 'CDP_LIVENESS_TIMEOUT' ? `${CDP_LIVENESS_TIMEOUT_MS}ms 内无响应` : raw;
+    // 浏览器整体不响应 CDP 是另一种签名（不是单个渲染进程僵死），同样只有此刻能取证。
+    void captureIncident('cdp-unresponsive', `调试端口 ${REMOTE_DEBUGGING_PORT} 上的浏览器无法处理 CDP 命令（${reason}）。`);
     throw new Error(
       [
         `调试端口 ${REMOTE_DEBUGGING_PORT} 上的浏览器无法处理 CDP 命令（${reason}）。`,

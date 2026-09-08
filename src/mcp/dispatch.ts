@@ -12,6 +12,7 @@
  *    下一次 CDP 调用即失败并自行解开，比让整个 server 永久卡住好得多。
  */
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { captureIncident } from '../common/incident.js';
 
 /** 传给每个工具实现的运行期上下文 */
 export type ToolContext = {
@@ -75,6 +76,13 @@ export async function runToolCall(options: RunToolCallOptions): Promise<CallTool
           watchdog = setTimeout(() => {
             console.error(
               `[boss-mcp] ${toolName} 超过 ${timeoutMs}ms 未完成，重置浏览器会话并放行队列`,
+            );
+            // 必须在 resetSession 之前存档：重置会断开 CDP，之后再采样就看不到当时的现场了。
+            // 这个分支正是「一次持续 54 分钟的僵死被每 3 分钟重试一次」那条链的入口。
+            void captureIncident(
+              'tool-watchdog',
+              `${toolName} 超过 ${timeoutMs}ms 未返回，看门狗已中止等待并重置浏览器会话。`,
+              { toolName },
             );
             void resetSession()
               .catch(() => {})

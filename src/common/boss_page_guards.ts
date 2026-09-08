@@ -1,6 +1,7 @@
 import type { Browser, CDPSession, Page, Target } from 'puppeteer-core';
 import { BOSS_CHAT_INDEX_URL } from './auth.js';
 import { BEHAVIOR_FETCH_PATTERNS, installBehaviorEnhancements } from './behavior_enhance.js';
+import { captureIncident } from './incident.js';
 
 const SHOULD_ALLOW_CONSOLE_CLEAR =
   process.env.BOSS_BROWSER_ALLOW_CONSOLE_CLEAR === 'true' ||
@@ -464,6 +465,13 @@ async function withGuardStep<T>(step: string, url: string, task: Promise<T>): Pr
   try {
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
+        // 即发即忘地存一份现场：这是僵死唯一能被抓住的时刻，浏览器重启就什么都没了。
+        // captureIncident 自己保证不抛、5 分钟内同类只存一份，所以放在这里是安全的。
+        void captureIncident(
+          'guard-step-timeout',
+          `页面防护注入卡住：${step} 在 ${PAGE_GUARD_STEP_TIMEOUT_MS}ms 内没有返回。卡住的页面：${url}。`,
+          { pageUrl: url },
+        );
         reject(
           new PageGuardStepTimeoutError(
             `页面防护注入卡住：${step} 在 ${PAGE_GUARD_STEP_TIMEOUT_MS}ms 内没有返回。` +
