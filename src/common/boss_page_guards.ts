@@ -404,18 +404,74 @@ const pagesWithInitGuard = new WeakSet<Page>();
 const pagesWithNavigationGuard = new WeakSet<Page>();
 const pagesWithRequestGuard = new WeakSet<Page>();
 
+/**
+ * 单步注入的超时。
+ *
+ * 为什么需要它：这些步骤都是 CDP 命令，目标的渲染进程一旦僵死，命令**不会报错，而是永远
+ * 不返回**。于是每次工具调用都白等到 puppeteer 的 protocolTimeout（默认 180s，本仓库配成
+ * 60s）才吐一句 `Page.addScriptToEvaluateOnNewDocument timed out`——这句话既指不出是哪个
+ * 页面卡住的，也说不出该怎么办。实测现场：用户连续 4 次打招呼各白等 60 秒后失败，
+ * 而同一时刻读列表是正常的（读走的是已注入过的旧 Page，不触发注入）。
+ *
+ * 15 秒的依据：正常注入是毫秒级，实测样本里没有超过 1 秒的；给到 15 秒纯粹是为
+ * 冷启动或页面正忙留余量。超过这个量级只能是僵死，再等下去没有意义。
+ */
+const PAGE_GUARD_STEP_TIMEOUT_MS = 15_000;
+
+/**
+ * 给单步注入套超时，并把「哪一步、哪个页面」写进错误信息。
+ *
+ * 注意：race 不会取消底层的 CDP 命令，它仍然挂在那里。这里要的不是取消，而是
+ * **快速失败并指明现场**——把 60 秒的无信息等待换成 15 秒的可行动报错。
+ */
+async function withGuardStepTimeout<T>(step: string, page: Page, task: Promise<T>): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const url = (() => {
+    try {
+      return page.url() || '(about:blank)';
+    } catch {
+      return '(url 不可读)';
+    }
+  })();
+  try {
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(
+          new Error(
+            `页面防护注入卡住：${step} 在 ${PAGE_GUARD_STEP_TIMEOUT_MS}ms 内没有返回。` +
+              `卡住的页面：${url}。` +
+              `这是该标签的渲染进程僵死，不是前端改版——CDP 命令在这种情况下不报错、只是永远不返回。` +
+              `处理办法：新开一个标签并关掉这个卡住的标签（浏览器和登录态都不用动），或重启浏览器。`,
+          ),
+        );
+      }, PAGE_GUARD_STEP_TIMEOUT_MS);
+    });
+    return await Promise.race([task, timeout]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
 async function ensurePageInitGuard(page: Page): Promise<void> {
   if (pagesWithInitGuard.has(page)) return;
   const script = buildPageGuardScript();
   // 走 puppeteer 的 evaluateOnNewDocument：内部会把脚本同步注册到主 frame CDP session，
   // 并在 OOPIF/iframe target 通过 `onAttachedToTarget` attach 时再次 addScript，
   // 因此可以覆盖隐藏 iframe 反检测对照场景。
-  await page.evaluateOnNewDocument(script);
+  await withGuardStepTimeout(
+    'Page.addScriptToEvaluateOnNewDocument（防护脚本）',
+    page,
+    page.evaluateOnNewDocument(script),
+  );
   // 当前文档已在加载中或已加载完成时，evaluateOnNewDocument 不会回溯执行；
   // 这里对当前主 frame 直接注入一次，让幂等的 try/catch 守卫立即生效。
-  await page.evaluate(script).catch(() => {
-    /* 当前文档可能还没创建执行上下文，由后续 navigation 触发 evaluateOnNewDocument 即可 */
-  });
+  await withGuardStepTimeout('Runtime.evaluate（对当前文档补注入）', page, page.evaluate(script)).catch(
+    () => {
+      /* 当前文档可能还没创建执行上下文，由后续 navigation 触发 evaluateOnNewDocument 即可 */
+    },
+  );
   pagesWithInitGuard.add(page);
 }
 
@@ -434,16 +490,24 @@ function ensurePageNavigationGuard(page: Page): void {
 
 async function ensurePageRequestGuard(page: Page): Promise<void> {
   if (pagesWithRequestGuard.has(page)) return;
-  const cdp = await page.createCDPSession();
-  await cdp.send('Network.setCacheDisabled', { cacheDisabled: true });
-  await cdp.send('Fetch.enable', {
-    patterns: [
-      ...BLOCKED_SECURITY_SCRIPT_PATTERNS,
-      ...BEHAVIOR_FETCH_PATTERNS,
-      ...REPORT_REQUEST_PATTERNS,
-      ...RISK_NAVIGATION_PATTERNS,
-    ],
-  });
+  const cdp = await withGuardStepTimeout('Target.attachToTarget（建 CDP session）', page, page.createCDPSession());
+  await withGuardStepTimeout(
+    'Network.setCacheDisabled',
+    page,
+    cdp.send('Network.setCacheDisabled', { cacheDisabled: true }),
+  );
+  await withGuardStepTimeout(
+    'Fetch.enable（风险脚本拦截）',
+    page,
+    cdp.send('Fetch.enable', {
+      patterns: [
+        ...BLOCKED_SECURITY_SCRIPT_PATTERNS,
+        ...BEHAVIOR_FETCH_PATTERNS,
+        ...REPORT_REQUEST_PATTERNS,
+        ...RISK_NAVIGATION_PATTERNS,
+      ],
+    }),
+  );
   cdp.on('Fetch.requestPaused', (params) => {
     const url = params.request.url;
     const method = params.request.method;
@@ -491,15 +555,19 @@ export async function installBossPageGuards(page: Page): Promise<void> {
   await ensurePageInitGuard(page);
   ensurePageNavigationGuard(page);
   await ensurePageRequestGuard(page);
-  await installBehaviorEnhancements(page);
+  await withGuardStepTimeout('行为增强注入', page, installBehaviorEnhancements(page));
 
   // 自动拒绝所有权限弹窗（"访问此设备上的其他应用和服务"等）
   try {
-    const cdp = await page.createCDPSession();
-    await cdp.send('Browser.setPermission', {
-      permission: { name: 'window-management' },
-      setting: 'denied',
-    }).catch(() => {});
+    const cdp = await withGuardStepTimeout('Target.attachToTarget（权限设置）', page, page.createCDPSession());
+    await withGuardStepTimeout(
+      'Browser.setPermission',
+      page,
+      cdp.send('Browser.setPermission', {
+        permission: { name: 'window-management' },
+        setting: 'denied',
+      }),
+    ).catch(() => {});
     await cdp.detach().catch(() => {});
   } catch { /* ignore - 不影响主流程 */ }
 }
@@ -522,8 +590,32 @@ export async function installBossBrowserPageGuards(browser: Browser): Promise<vo
     browsersWithTargetGuard.add(browser);
   }
 
+  // 这一遍是对**所有**标签的兜底扫描。真正要操作的那个页面，调用方（browser_session.ts /
+  // boss_session_page.ts）会单独再调一次 installBossPageGuards，那一次失败就该让工具失败。
+  //
+  // 所以这里对单个标签的失败只大声记录、不中断：一个僵死标签的渲染进程已经跑不了 JS，
+  // 它带来的风控风险本就趋近于零，却会因为这一遍 await 把所有工具一起拖死——今天现场就是
+  // 这个形态（读列表正常、任何需要新建 Page 的操作白等 60 秒失败）。
+  // 注意这不是「失败静默降级」：失败页面的 URL 会被点名，操作者据此关掉它即可。
   const pages = (await browser.pages()).filter((p) => !p.isClosed());
+  const failed: string[] = [];
   for (const page of pages) {
-    await installBossPageGuards(page);
+    try {
+      await installBossPageGuards(page);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      let url = '(url 不可读)';
+      try {
+        url = page.url() || '(about:blank)';
+      } catch { /* 页面可能已不可用 */ }
+      failed.push(url);
+      console.error(`[boss-cli] 标签防护安装失败（已跳过该标签，不影响其它标签）：${url} —— ${msg}`);
+    }
+  }
+  if (failed.length > 0) {
+    console.error(
+      `[boss-cli] 共 ${failed.length} 个标签的防护未装上：${failed.join('、')}。` +
+        `这些标签的渲染进程很可能已僵死，建议关掉它们；若接下来的工具调用报同样的错，说明卡住的正是工作标签。`,
+    );
   }
 }
