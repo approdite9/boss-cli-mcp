@@ -11,6 +11,7 @@
  */
 import { sleepRandom } from '../browser/index.js';
 import { pendingCountAfter, requirePool, savePool, type Pool, type PoolCandidate } from './pool.js';
+import { reportPartialFailures } from './tool_metrics.js';
 
 export type PoolBatchOptions = {
   job: string;
@@ -221,6 +222,11 @@ export async function runPoolBatch(
   }
 
   await savePool(pool);
+
+  // 让审计日志能看见单人失败。不上报的话这次调用会以 outcome=ok 落盘，
+  // 「今天打招呼失败了几次」这个问题就永远查不出来（实测 101 次带失败的批量调用，
+  // outcome=error 是 0 次）。
+  reportPartialFailures(failCount);
 
   const remaining = pendingCountAfter(pool, spec.pickTargets);
   const header = aborted

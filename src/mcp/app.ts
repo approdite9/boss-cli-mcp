@@ -32,6 +32,7 @@ import { getPackageMeta } from '../cli/version.js';
 import { runToolCall, textResult, type ToolContext } from './dispatch.js';
 import { formatEnvLoadReport, loadMcpEnv } from './env.js';
 import { logAudit } from './mcp_log.js';
+import { resetToolMetrics, takePartialFailures } from './tool_metrics.js';
 import {
   assertDebugPortBrowserIsHeadful,
   assertHeadfulRuntime,
@@ -1147,6 +1148,9 @@ export function buildServer(): Server {
     // 分开记的原因：审计里只有一个总时长时，「前面那个调用超时 180s」会被读成
     // 「本次调用自己跑了 364s」，进而误判成单次调用看门狗（240s）失效——现场就误判过一次。
     let execStartedAt = auditStartedAt;
+    // 清零上一次调用可能留下的子项失败数。必须在 serialize 之前做：
+    // 工具执行是串行的，清零 → 执行中上报 → 落审计时取走，这条路径没有并发歧义。
+    resetToolMetrics();
     const result = await serialize(() => {
       execStartedAt = Date.now();
       return runToolCall({
@@ -1179,11 +1183,14 @@ export function buildServer(): Server {
     });
 
     const finishedAt = Date.now();
+    const partialFailures = takePartialFailures();
     logAudit({
       toolName,
       consumesQuota: QUOTA_CONSUMING_TOOLS.has(toolName),
       args: summarizeForAudit(JSON.stringify(args)),
-      outcome: result.isError === true ? 'error' : 'ok',
+      partialFailures,
+      // 批量工具里「一个都没成」和「全成了」原先都记 outcome=ok，无法区分。
+      outcome: result.isError === true ? 'error' : partialFailures > 0 ? 'partial' : 'ok',
       durationMs: finishedAt - auditStartedAt,
       queueMs: execStartedAt - auditStartedAt,
       execMs: finishedAt - execStartedAt,

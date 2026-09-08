@@ -190,11 +190,26 @@ export function logAccess(rec: AccessRecord): void {
 
 export type AuditRecord = {
   toolName: string;
+  /**
+   * 子项失败数（批量工具用）。
+   *
+   * 为什么必须单独记：批量工具把单人失败收进返回摘要，审计行只反映「流程跑完了」，
+   * 于是 `outcome` 恒为 `ok`。实测 322 次批量调用里 101 次摘要写着「失败 N（N≥1）」，
+   * 而 `outcome=error` 是 0 次——按 `outcome` 统计打招呼失败率会得到 0。
+   * 有了这个字段，`fails=` 就是可直接 grep 的失败率口径。
+   */
+  partialFailures?: number;
   /** 是否属于消耗平台配额的工具（打招呼次数 / 每日简历查看次数） */
   consumesQuota: boolean;
   /** 入参；已在调用方做长度截断，避免把简历正文之类的大字段写进日志 */
   args: string;
-  outcome: 'ok' | 'error';
+  /**
+   * `ok` = 没有任何东西失败；`partial` = 流程跑完但有子项失败；`error` = 整次调用失败。
+   *
+   * 加 `partial` 是因为原先只有两档时，「50 个人一个都没打成」和「50 个人全打成了」
+   * 在审计里长得一模一样，都是 `outcome=ok`。
+   */
+  outcome: 'ok' | 'partial' | 'error';
   /** 总时长：从收到请求到返回结果，= queueMs + execMs */
   durationMs: number;
   /** 串行队列里的等待时长 */
@@ -241,6 +256,9 @@ export function logAudit(rec: AuditRecord): void {
       `tool=${rec.toolName}`,
       `quota=${rec.consumesQuota ? 'yes' : 'no'}`,
       `outcome=${rec.outcome}`,
+      // 只在真有子项失败时写，避免给单次调用类工具加一个无意义的字段。
+      // 统计口径：`fails=` 出现即代表这次调用里有东西失败了。
+      ...(rec.partialFailures && rec.partialFailures > 0 ? [`fails=${rec.partialFailures}`] : []),
       `duration=${rec.durationMs}ms`,
       `queue=${rec.queueMs}ms`,
       `exec=${rec.execMs}ms`,
