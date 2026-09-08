@@ -10,9 +10,11 @@
  *   匹配不到会直接报错，不会退化成模糊匹配。
  * - greet 的原始输出会把整个推荐/深搜列表 dump 出来，批量时必须压成一行。
  */
+import { withBossSessionPage } from '../common/boss_session_page.js';
+import { ensureInRecommendPage, readRecommendList } from '../toolset/recommend.js';
 import { implRecommendGreet } from '../toolset/index.js';
-import { pendingCandidates } from './pool.js';
-import { runPoolBatch, type PoolBatchOptions } from './pool_batch.js';
+import { pendingCandidates, type PoolCandidate } from './pool.js';
+import { runPoolBatch, type PoolBatchOptions, type TargetVerification } from './pool_batch.js';
 
 /** 单次批量打招呼的硬上限：即便调用方传了更大的 limit，也不允许一次打超过这个数 */
 export const GREET_BATCH_HARD_LIMIT = 50;
@@ -66,5 +68,42 @@ export async function greetAll(options: GreetAllOptions): Promise<string> {
       candidate.lastError = message;
     },
     summarize: summarizeGreetOutput,
+    verifyTargets: verifyGreetTargets,
+  });
+}
+
+/**
+ * 预演阶段免配额地核对：页面还能用吗？这批人还在当前推荐列表里吗？
+ *
+ * 针对的是真实用法里最贵的失败：AI 筛几十分钟，等到批量打招呼时才发现推荐列表已经换过一批，
+ * 或者页面在这段空闲里僵死了——两种情况今天的日志里都有（「此人已不在列表里」、
+ * 「addScriptToEvaluateOnNewDocument timed out」）。这两件事都能在预演时问出来，代价为零。
+ *
+ * 全程只读：`readRecommendList` 只枚举卡片，不点击、不导航、不消耗任何配额。
+ */
+async function verifyGreetTargets(targets: PoolCandidate[]): Promise<TargetVerification> {
+  return withBossSessionPage(async (page) => {
+    const frame = await ensureInRecommendPage(page);
+    const list = await readRecommendList(frame);
+
+    const geekIds = new Set(list.map((c) => c.geekId).filter((v): v is string => !!v));
+    const names = new Set(list.map((c) => c.name).filter(Boolean));
+
+    const locatableIds: number[] = [];
+    const missing: Array<{ id: number; name: string; reason: string }> = [];
+    for (const c of targets) {
+      if (c.geekId) {
+        // 有 geekId 就只认 geekId：执行时也是这么定位的，这里必须用同一判据，
+        // 否则预演说「能打」而执行报「找不到」，比不核对更糟。
+        if (geekIds.has(c.geekId)) locatableIds.push(c.id);
+        else missing.push({ id: c.id, name: c.name, reason: `geekId=${c.geekId} 不在当前列表` });
+        continue;
+      }
+      // 没有 geekId 的（深搜来源或老数据）执行时按精确姓名定位，这里同样按姓名核对
+      if (names.has(c.name)) locatableIds.push(c.id);
+      else missing.push({ id: c.id, name: c.name, reason: '无 geekId，且当前列表没有同名候选人' });
+    }
+
+    return { pageUsable: true, locatableIds, missing, listSize: list.length };
   });
 }

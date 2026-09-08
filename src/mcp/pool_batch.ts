@@ -43,6 +43,31 @@ export type PoolBatchSpec = {
   onFailure: (candidate: PoolCandidate, message: string) => void;
   /** 把单次原始输出压成一行摘要（原始输出往往很长，直接拼会撑爆上下文） */
   summarize: (rawOutput: string) => string;
+  /**
+   * 可选：预演阶段去**当前页面**核对这批候选人还能不能定位到。
+   *
+   * 为什么必须在预演里做，而不是等执行时逐个报错：真实用法是「AI 筛几十分钟 → 再批量执行」，
+   * 而推荐列表是易失的，这段间隔里很可能已经换过一批。等到执行时才发现人不在了，
+   * 筛选的工夫已经白花，而且页面若在此期间僵死，第一个候选人就会白等一次超时。
+   * 预演是免配额的，把「还能不能打」提前到这里问，代价为零。
+   *
+   * 不实现这个钩子的动作（如抓简历）预演行为保持原样。
+   */
+  verifyTargets?: (targets: PoolCandidate[]) => Promise<TargetVerification>;
+};
+
+/** 预演阶段对页面的核对结果。 */
+export type TargetVerification = {
+  /** 页面本身是否可用；false 时 detail 要说清原因（僵死 / 不在推荐页 / 未登录…） */
+  pageUsable: boolean;
+  /** 页面不可用时的说明 */
+  detail?: string;
+  /** 当前页面上能定位到的候选人 id（对应 PoolCandidate.id） */
+  locatableIds?: number[];
+  /** 定位不到的候选人及原因 */
+  missing?: Array<{ id: number; name: string; reason: string }>;
+  /** 当前列表规模，用于判断是否已经整体轮换 */
+  listSize?: number;
 };
 
 function isAbortError(e: unknown): boolean {
@@ -59,18 +84,55 @@ function renderDryRun(
   job: string,
   targets: PoolCandidate[],
   skipped: number,
+  verification: TargetVerification | null,
 ): string {
   if (targets.length === 0) {
     return `集合「${job}」没有需要${spec.actionName}的候选人（可能都已处理过，或集合为空）。`;
   }
+
+  const missingById = new Map((verification?.missing ?? []).map((m) => [m.id, m]));
   const lines = [
     `【预演 dryRun】将对以下 ${targets.length} 人${spec.actionName}，预计消耗 ${targets.length} 次${spec.quotaNote}：`,
     '',
-    ...targets.map((c) => `- ${c.id}. ${c.name}${c.tag ? ` [${c.tag}]` : ''}`),
+    ...targets.map((c) => {
+      const miss = missingById.get(c.id);
+      const mark = miss ? `  ❌ 现在定位不到：${miss.reason}` : verification ? '  ✅ 当前列表可定位' : '';
+      return `- ${c.id}. ${c.name}${c.tag ? ` [${c.tag}]` : ''}${mark}`;
+    }),
   ];
   if (skipped > 0) {
     lines.push('', `（因 limit 本次跳过 ${skipped} 人，下次可继续）`);
   }
+
+  if (verification && !verification.pageUsable) {
+    // 页面本身不可用时不要让人去传 dryRun=false——那只会白等一次超时
+    lines.push(
+      '',
+      `⚠️ 当前页面无法用于${spec.actionName}：${verification.detail ?? '原因未知'}`,
+      `现在传 dryRun=false 只会失败。请先修好页面，再重新预演。`,
+    );
+    return lines.join('\n');
+  }
+
+  if (verification) {
+    const missing = verification.missing ?? [];
+    lines.push(
+      '',
+      `页面核对：当前列表 ${verification.listSize ?? '?'} 人，可定位 ${targets.length - missing.length}/${targets.length}。`,
+    );
+    if (missing.length === targets.length) {
+      lines.push(
+        `⚠️ 这批人在当前列表里**一个都定位不到**，说明推荐列表已经整体换过一批。`,
+        `执行只会全部失败且不消耗配额。需要重新调 boss_recommend 读取列表，再对新列表重新筛选。`,
+      );
+    } else if (missing.length > 0) {
+      lines.push(
+        `⚠️ 有 ${missing.length} 人已不在当前列表（上面标了 ❌）。执行时这些人会失败且不消耗配额，`,
+        `其余 ${targets.length - missing.length} 人可以正常打。`,
+      );
+    }
+  }
+
   lines.push('', '确认无误后传 dryRun=false 才会真正执行。', spec.precondition);
   return lines.join('\n');
 }
@@ -94,7 +156,18 @@ export async function runPoolBatch(
   const skipped = pending.length - targets.length;
 
   if (dryRun) {
-    return renderDryRun(spec, job, targets, skipped);
+    // 核对失败不能让预演也失败：预演的价值就是「不花代价地告诉你现状」，
+    // 所以核对本身出错时如实带上原因，而不是把整个预演变成一个报错。
+    let verification: TargetVerification | null = null;
+    if (spec.verifyTargets && targets.length > 0) {
+      try {
+        verification = await spec.verifyTargets(targets);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        verification = { pageUsable: false, detail: `页面核对未能完成：${msg}` };
+      }
+    }
+    return renderDryRun(spec, job, targets, skipped, verification);
   }
   if (targets.length === 0) {
     return `集合「${job}」没有需要${spec.actionName}的候选人，未执行任何操作。`;
