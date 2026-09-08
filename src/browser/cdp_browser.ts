@@ -381,6 +381,31 @@ export const LAUNCH_ARGS_LESS_AUTOMATION = [
   '--disable-notifications',
 ] as const;
 
+/**
+ * 额外的 Chrome 启动参数，空格分隔，来自 `BOSS_BROWSER_EXTRA_ARGS`。
+ *
+ * 存在的理由：诊断能力（崩溃日志、verbose 日志）需要能临时开关，而不是改代码再发一次。
+ * 现场遇到的问题就属于这一类——渲染进程僵死时既没有崩溃转储也没有 Chrome 日志，
+ * 只能靠猜；有了这个入口，下次出问题前就能把取证打开，出问题后再关掉。
+ *
+ * 刻意不支持带空格的参数值：那需要引号解析，而目前所有诊断参数（`--log-file=` 的路径、
+ * `--vmodule=` 的模式表）都不含空格。写错的条目直接抛错，不静默丢弃——
+ * 否则会出现「以为诊断开着、其实参数被吃了」这种最坏情况。
+ */
+function readExtraChromeArgs(): string[] {
+  const raw = process.env.BOSS_BROWSER_EXTRA_ARGS?.trim();
+  if (!raw) return [];
+  const parts = raw.split(/\s+/).filter(Boolean);
+  const bad = parts.filter((p) => !p.startsWith('--'));
+  if (bad.length > 0) {
+    throw new Error(
+      `BOSS_BROWSER_EXTRA_ARGS 里有不以 -- 开头的条目：${bad.join(' ')}。` +
+        `该变量按空格分隔，不支持带空格的参数值。`,
+    );
+  }
+  return parts;
+}
+
 /** 仅用于本地调试：尽量放宽同源/CORS 限制，便于跨域 iframe/canvas 处理。 */
 export const LAUNCH_ARGS_ALLOW_ALL_CORS = [
   '--disable-web-security',
@@ -535,6 +560,25 @@ export async function connectBrowser(options: ConnectBrowserOptions = {}): Promi
       }
     }
     console.error(`[boss-cli] CloakBrowser 隐身模式已启用 (executable: ${executablePath})`);
+  }
+
+  // ─── 额外启动参数（诊断用，来自 BOSS_BROWSER_EXTRA_ARGS）───────────────────
+  const extraArgs = readExtraChromeArgs();
+  if (extraArgs.length > 0) {
+    const applied: string[] = [];
+    for (const arg of extraArgs) {
+      const key = arg.split('=')[0];
+      if (chromeArgs.some((a) => a.startsWith(key!))) {
+        // 已有同名参数就不覆盖，但要说出来：否则会以为诊断开了、其实没生效
+        console.error(`[boss-cli] 额外启动参数 ${key} 已存在于默认参数中，本次忽略：${arg}`);
+        continue;
+      }
+      chromeArgs.push(arg);
+      applied.push(arg);
+    }
+    if (applied.length > 0) {
+      console.error(`[boss-cli] 已附加额外启动参数：${applied.join(' ')}`);
+    }
   }
 
   /**
