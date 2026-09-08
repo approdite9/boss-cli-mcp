@@ -90,13 +90,18 @@ function renderDryRun(
     return `集合「${job}」没有需要${spec.actionName}的候选人（可能都已处理过，或集合为空）。`;
   }
 
+  // 「✅ 可定位」只能在**页面真的被读过**时才允许打。原先的判据是「不在 missing 里」，
+  // 而页面不可用（僵死 / 不在推荐页 / 核对本身抛错）时 missing 恒为空，于是一个都没核对过的
+  // 名单会被整排标成「✅ 当前列表可定位」，再在下面跟一句「页面无法用于打招呼」——
+  // 自相矛盾，而且假的那半句在上面、先被读到。这正是本轮要消灭的「什么都没验证却报成功」。
+  const verified = verification !== null && verification.pageUsable;
   const missingById = new Map((verification?.missing ?? []).map((m) => [m.id, m]));
   const lines = [
     `【预演 dryRun】将对以下 ${targets.length} 人${spec.actionName}，预计消耗 ${targets.length} 次${spec.quotaNote}：`,
     '',
     ...targets.map((c) => {
       const miss = missingById.get(c.id);
-      const mark = miss ? `  ❌ 现在定位不到：${miss.reason}` : verification ? '  ✅ 当前列表可定位' : '';
+      const mark = miss ? `  ❌ 现在定位不到：${miss.reason}` : verified ? '  ✅ 当前列表可定位' : '';
       return `- ${c.id}. ${c.name}${c.tag ? ` [${c.tag}]` : ''}${mark}`;
     }),
   ];

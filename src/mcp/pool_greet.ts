@@ -11,7 +11,7 @@
  * - greet 的原始输出会把整个推荐/深搜列表 dump 出来，批量时必须压成一行。
  */
 import { withBossSessionPage } from '../common/boss_session_page.js';
-import { ensureInRecommendPage, readRecommendList } from '../toolset/recommend.js';
+import { assertRecommendPageReady, readRecommendList } from '../toolset/recommend.js';
 import { implRecommendGreet } from '../toolset/index.js';
 import { pendingCandidates, type PoolCandidate } from './pool.js';
 import { runPoolBatch, type PoolBatchOptions, type TargetVerification } from './pool_batch.js';
@@ -80,10 +80,21 @@ export async function greetAll(options: GreetAllOptions): Promise<string> {
  * 「addScriptToEvaluateOnNewDocument timed out」）。这两件事都能在预演时问出来，代价为零。
  *
  * 全程只读：`readRecommendList` 只枚举卡片，不点击、不导航、不消耗任何配额。
+ *
+ * 页面判据必须用 `assertRecommendPageReady`（按契约**不导航**），不能用 `ensureInRecommendPage`。
+ * 后者在「URL 不是推荐页」或「渲染进程僵死」时会 `page.goto` 重载推荐页，于是：
+ *   - 列表换一批，本轮筛出来的人全部作废——预演本该只是报告现状，却把现状销毁了；
+ *   - 重载后的推荐页落在哪个岗位未经验证，可能静默切成默认岗位，整批筛选白费；
+ *   - 僵死时它先重载再报「一个都定位不到」，把「页面坏了」误报成「列表轮换了」。
+ * 执行路径（`toolset/greet.ts`）用的就是 `assertRecommendPageReady` + 关掉两个 ensure，
+ * 预演必须与它逐字一致：预演比执行更具侵入性是说不通的。
+ *
+ * 页面不可用时这里直接抛错，由 `pool_batch.ts` 统一转成 `pageUsable: false` + 原因，
+ * 预演文案会据此告诉调用方「现在传 dryRun=false 只会失败」。
  */
 async function verifyGreetTargets(targets: PoolCandidate[]): Promise<TargetVerification> {
   return withBossSessionPage(async (page) => {
-    const frame = await ensureInRecommendPage(page);
+    const frame = await assertRecommendPageReady(page, '预演核对');
     const list = await readRecommendList(frame);
 
     const geekIds = new Set(list.map((c) => c.geekId).filter((v): v is string => !!v));
@@ -105,5 +116,5 @@ async function verifyGreetTargets(targets: PoolCandidate[]): Promise<TargetVerif
     }
 
     return { pageUsable: true, locatableIds, missing, listSize: list.length };
-  });
+  }, { ensureChatShell: false, ensureMenuList: false });
 }
