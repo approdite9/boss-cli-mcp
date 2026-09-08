@@ -82,9 +82,24 @@ node skills/boss-frontend-analysis/scripts/check_dom_selectors.mjs --port 53470
 
 ### 3. 锚点看守 / 定时检测 + 候选推导 (`selector_watch.mjs`)
 
-无人值守版本。与上面第 2 个脚本的**唯一**安全差别：它**会自己开一个新标签并导航**到要检查的
-页面，检查完关掉——因为定时任务不能假设某个页面正好开着。上一版靠「当前页面」判定，
+无人值守版本。与上面第 2 个脚本的**唯一**安全差别：它**会自己开一个标签并导航**到要检查的
+页面——因为定时任务不能假设某个页面正好开着。上一版靠「当前页面」判定，
 结果职位管理页从来没被检查过，而真正坏掉的恰好就是它。
+
+**常驻标签（不要改回「每轮开关」）**：`boss_page_guards.ts` 注册了 `targetcreated`，
+浏览器里每新建一个标签，boss-mcp 都会对它注入两段脚本并建一次 CDP session。
+第一版每轮新建再关闭，等于每轮都逼服务对一个即将消失的标签做注入——实测那段时间用户的
+打招呼连续报 `Page.addScriptToEvaluateOnNewDocument timed out`，时间窗口对得上。
+现在常驻一个标签，注入只在首次创建时发生一次，之后每轮只是导航。
+
+标签靠 URL hash `#boss-selector-watch` 识别（比记 targetId 简单，也不用碰 puppeteer 私有字段，
+而且人在浏览器里能看出这标签是谁开的）。跑完停靠在 `https://www.zhipin.com/favicon.ico#boss-selector-watch`——
+这个地址是两次踩坑定下来的：停在推荐页会让常驻标签自己变成僵死候选，下一轮直接
+`Network.enable timed out`；停在 `about:blank` 会命中 `RISK_NAVIGATION_RE`，被服务的
+framenavigated 守卫导航到 `/web/chat/index`，hash 标记被冲掉、每轮新建一个，标签越积越多。
+
+`acquireWatchTab` 用 `browser.targets()` 而不是 `browser.pages()`：后者会挨个 attach 所有标签、
+对每个发 `Network.enable`，**任何一个标签僵死都会把整个调用拖死**（实测就是这么炸的）。
 
 ```bash
 # 采基线（务必在代码已验证可用时采，这是整套机制的判定依据）

@@ -52,6 +52,21 @@ const DEFAULT_CDP_PORT = 53470;
 const CDP_PROTOCOL_TIMEOUT_MS = 45_000;
 
 /**
+ * 看守自己那个标签的标识。
+ *
+ * 为什么要持久标签而不是每轮开关：`boss_page_guards.ts` 注册了 `targetcreated`，
+ * **浏览器里每新建一个标签，boss-mcp 就会对它注入两段脚本并建一次 CDP session**。
+ * 首版每轮新建再关掉，等于每轮都逼服务对一个即将消失的标签做注入——实测这段时间里
+ * 用户的打招呼连续报 `Page.addScriptToEvaluateOnNewDocument timed out`，时间窗口对得上。
+ * 改成常驻一个标签后，注入只在这个标签首次创建时发生一次，之后每轮只是导航。
+ *
+ * 用 URL hash 当标识（实测 Boss 的路由不会把它吃掉，带 hash 时列表照样渲染 13 行）：
+ * 比记 targetId 简单，也不用碰 puppeteer 的私有字段，而且人在浏览器里能直接看出
+ * 这个标签是谁开的、干什么用的。
+ */
+const WATCH_TAB_MARKER = 'boss-selector-watch';
+
+/**
  * 提取阶段的重试次数。
  *
  * 只对「CDP 层瞬时故障」重试，且重试次数会记进日志。这不是掩盖失败：
@@ -739,16 +754,75 @@ function buildReadyExpression(pageDef) {
 }
 
 /**
- * 在自己的新标签里打开目标页，返回承载内容的 frame。
- * 用新标签而不是复用工作标签：看守不该把用户正在看的页面导航走。
+ * 跑完之后把常驻标签停在哪。
+ *
+ * 两次踩坑才定下来这个地址：
+ *
+ * 1. 停在推荐页（第一版：干脆不停，留在最后检查的那一页）——两个标签同时挂着推荐页，
+ *    下一轮 `acquireWatchTab` 直接报 `Network.enable timed out`，常驻标签自己成了僵死候选。
+ * 2. 停在 `about:blank`（第二版）——`about:blank` 命中 `boss_page_guards.ts` 里的
+ *    `RISK_NAVIGATION_RE`，服务的 framenavigated 守卫会立刻把它导航到 `/web/chat/index`。
+ *    结果 hash 标记被冲掉，下一轮找不到自己的标签，于是每轮新建一个，标签越积越多（实测 2→3→4）。
+ *
+ * favicon 是同源静态图片：不匹配任何风险导航模式，渲染成本可以忽略，hash 也留得住。
+ */
+const WATCH_TAB_PARK_URL = `https://www.zhipin.com/favicon.ico#${WATCH_TAB_MARKER}`;
+
+/**
+ * 拿到看守自己的常驻标签：带标记的已存在就复用，否则新建一个（仅此一次会触发服务注入）。
+ *
+ * 用 `browser.targets()` 而不是 `browser.pages()`：后者会挨个 attach 每个标签，
+ * 对每个都发 `Network.enable`，**任何一个标签的渲染进程僵死都会把整个调用拖死**
+ * （实测就是这么炸的）。`targets()` 是同步的、不 attach，只对我们自己那个标签
+ * 调 `target.page()`，把「别人的标签坏了」和「我们的标签坏了」彻底隔开。
+ *
+ * 绝不复用用户的工作标签——看守不该把别人正在看的页面导航走。
+ * 多于一个带标记的标签说明上一轮异常留下了残留，关掉多余的，只留第一个。
+ */
+async function acquireWatchTab(browser) {
+  const marked = browser
+    .targets()
+    .filter((t) => t.type() === 'page' && (t.url() || '').includes(WATCH_TAB_MARKER));
+
+  if (marked.length > 0) {
+    const page = await marked[0].page();
+    if (page && !page.isClosed()) {
+      let closedExtras = 0;
+      for (const extra of marked.slice(1)) {
+        const p = await extra.page().catch(() => null);
+        if (p && !p.isClosed()) {
+          await p.close().catch(() => {});
+          closedExtras += 1;
+        }
+      }
+      return { page, created: false, closedExtras };
+    }
+  }
+
+  const page = await browser.newPage();
+  return { page, created: true, closedExtras: 0 };
+}
+
+/** 跑完把常驻标签停到 about:blank，别让它一直占着一个渲染中的 Boss 页面。 */
+async function parkWatchTab(page) {
+  try {
+    await page.goto(WATCH_TAB_PARK_URL, { waitUntil: 'load', timeout: 15_000 });
+    return { parked: true, reason: null };
+  } catch (e) {
+    return { parked: false, reason: e.message };
+  }
+}
+
+/**
+ * 把常驻标签导航到目标页，返回承载内容的 frame。
  *
  * frame 一旦找到就保留，即使就绪探测不过也照样返回——「页面开着但内容没出来」和
  * 「根本没找到 frame」是两种不同的结论，前者要继续往下测并如实记 found=0，
  * 后者才是真的没法测。混成一种会把锚点失效误报成环境问题。
  */
-async function openPage(browser, pageDef) {
-  const page = await browser.newPage();
-  await page.goto(pageDef.url, { waitUntil: 'load', timeout: 60_000 });
+async function openPage(page, pageDef) {
+  // hash 只作标记，不影响路由（已实测）
+  await page.goto(`${pageDef.url}#${WATCH_TAB_MARKER}`, { waitUntil: 'load', timeout: 60_000 });
 
   const readyExpr = buildReadyExpression(pageDef);
   const deadline = Date.now() + PAGE_READY_TIMEOUT_MS;
@@ -908,6 +982,32 @@ async function main() {
   let brokenTotal = 0;
   let appliedTotal = 0;
 
+  // 常驻标签只取一次，整轮共用；结束时**不关**，避免下一轮再触发服务的注入
+  let watchTab;
+  try {
+    watchTab = await acquireWatchTab(browser);
+  } catch (e) {
+    R(`❌ 取看守标签失败：${e.message}`);
+    records.push({ runId, ts: nowIso(), scope: 'run', decision: 'skip', reason: 'tab-acquire-failed', detail: e.message });
+    await logRecords(records);
+    const f = await writeReport(runId, report);
+    console.log(`\n报告：${f}`);
+    process.exit(3);
+  }
+  R(
+    `看守标签：${watchTab.created ? '新建（本次会触发一次服务注入）' : '复用已有'}` +
+      `${watchTab.closedExtras > 0 ? `，清理残留 ${watchTab.closedExtras} 个` : ''}`,
+  );
+  records.push({
+    runId,
+    ts: nowIso(),
+    scope: 'run',
+    decision: 'tab-acquired',
+    tabCreated: watchTab.created,
+    closedExtras: watchTab.closedExtras,
+  });
+  R('');
+
   for (const pageKey of pageKeys) {
     const pageDef = REGISTRY[pageKey];
     const anchors = resolveAnchors(pageKey, pageDef, opts.selftest);
@@ -915,12 +1015,36 @@ async function main() {
     R(`──────── ${pageKey}：${pageDef.label} ────────`);
 
     let opened;
+    let tabRecreated = false;
     try {
-      opened = await openPage(browser, pageDef);
+      opened = await openPage(watchTab.page, pageDef);
     } catch (e) {
-      R(`  ❌ 打开页面失败：${e.message}`);
-      records.push({ runId, ts: nowIso(), scope: 'page', page: pageKey, decision: 'skip', reason: 'open-failed', detail: e.message });
-      continue;
+      // 常驻标签自己卡死时导航会失败。不静默换一个：关掉重建，并把这件事明确记进日志——
+      // 如果它每晚都发生，数据里看得见，那就是浏览器层面的问题而不是前端改版。
+      R(`  ⚠️  常驻标签导航失败：${e.message}`);
+      try {
+        await watchTab.page.close().catch(() => {});
+        watchTab = await acquireWatchTab(browser);
+        tabRecreated = true;
+        R('  ↻ 已关掉卡死的标签并新建一个（这会再触发一次服务注入）');
+        opened = await openPage(watchTab.page, pageDef);
+      } catch (e2) {
+        R(`  ❌ 重建标签后仍失败：${e2.message}`);
+        records.push({
+          runId,
+          ts: nowIso(),
+          scope: 'page',
+          page: pageKey,
+          decision: 'skip',
+          reason: 'open-failed',
+          detail: `${e.message} | 重建后：${e2.message}`,
+          tabRecreated: true,
+        });
+        continue;
+      }
+    }
+    if (tabRecreated) {
+      records.push({ runId, ts: nowIso(), scope: 'page', page: pageKey, decision: 'tab-recreated', reason: 'stale-watch-tab' });
     }
     const { page, frame, ready, attempts, readyDetail } = opened;
 
@@ -928,13 +1052,11 @@ async function main() {
     if (looksLoggedOut(landedUrl)) {
       R(`  ⏭️  未登录（落到 ${landedUrl.slice(0, 80)}），无法检测——不记为锚点失效。`);
       records.push({ runId, ts: nowIso(), scope: 'page', page: pageKey, decision: 'skip', reason: 'logged-out', url: landedUrl });
-      await page.close().catch(() => {});
       continue;
     }
     if (!frame) {
       R(`  ❌ 未找到承载内容的 frame（期望包含 ${pageDef.framePattern}）`);
       records.push({ runId, ts: nowIso(), scope: 'page', page: pageKey, decision: 'skip', reason: 'frame-missing' });
-      await page.close().catch(() => {});
       continue;
     }
     R(`  frame 就绪=${ready}（轮询 ${attempts} 次）  ${frame.url().slice(0, 100)}`);
@@ -974,7 +1096,6 @@ async function main() {
         attempts: EXTRACT_MAX_ATTEMPTS,
         errors: extractErrors,
       });
-      await page.close().catch(() => {});
       continue;
     }
     if (extractErrors.length > 0) {
@@ -1031,7 +1152,6 @@ async function main() {
       await writeFile(path.join(BASELINE_DIR, `${pageKey}.json`), JSON.stringify(snap, null, 2), 'utf8');
       R(`  ✅ 基线已写入 ${path.join(BASELINE_DIR, `${pageKey}.json`)}`);
       records.push({ runId, ts: nowIso(), scope: 'page', page: pageKey, decision: 'baseline-saved', rowCount: data.rowCount, pageCount: data.pageCount });
-      await page.close().catch(() => {});
       R('');
       continue;
     }
@@ -1274,9 +1394,18 @@ async function main() {
       records.push(record);
     }
 
-    await page.close().catch(() => {});
     R('');
   }
+
+  // 常驻标签不关，但要停到 about:blank：留在 Boss 页面上会一直渲染、占内存，
+  // 下一轮 attach 它时还可能已经僵死。
+  const parked = await parkWatchTab(watchTab.page);
+  R(
+    parked.parked
+      ? `常驻标签已停到 ${WATCH_TAB_PARK_URL}（不关闭，避免下轮新建再触发服务注入）`
+      : `⚠️  常驻标签停靠失败：${parked.reason}`,
+  );
+  records.push({ runId, ts: nowIso(), scope: 'run', decision: 'tab-parked', parked: parked.parked, reason: parked.reason });
 
   await browser.disconnect().catch(() => {});
 
