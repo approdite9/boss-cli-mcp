@@ -6,7 +6,11 @@ import {
   sleepRandom,
   humanClick,
 } from '../browser/index.js';
-import { formatLoggedOutMessage, isOutsideBossShellUrl } from '../common/auth.js';
+import {
+  assertNotBouncedOutOfShell,
+  formatLoggedOutMessage,
+  isOutsideBossShellUrl,
+} from '../common/auth.js';
 import { withBossSessionPage } from '../common/boss_session_page.js';
 import { ensurePage, isPageAlive } from '../common/ensure_page.js';
 import { rethrowWaitTimeout } from '../common/wait_timeout.js';
@@ -841,11 +845,20 @@ export async function openRecommendResumePreview(frame: Frame, target: string): 
 export async function runRecommend(jobKeyword?: string): Promise<string> {
   try {
     return await withBossSessionPage(async (page) => {
-      const frame = await ensureInRecommendPage(page);
-      const selectedJob = await selectRecommendJob(frame, (jobKeyword ?? '').trim());
-      const candidates = await readRecommendList(frame);
-      const title = selectedJob ? `当前岗位：${selectedJob}` : '当前岗位：默认';
-      return [title, '', renderRecommendList(candidates)].join('\n');
+      try {
+        const frame = await ensureInRecommendPage(page);
+        const selectedJob = await selectRecommendJob(frame, (jobKeyword ?? '').trim());
+        const candidates = await readRecommendList(frame);
+        const title = selectedJob ? `当前岗位：${selectedJob}` : '当前岗位：默认';
+        return [title, '', renderRecommendList(candidates)].join('\n');
+      } catch (e) {
+        // 被踢出主壳时这里抛的是 `frame got detached`，而弹出的那次导航还没落定，
+        // 所以必须等一下再判 URL——否则会把「票据失效」报成「页面被导航走」，
+        // 并照旧输出「不要调 boss_login」，把唯一的解法排除掉。
+        // 等不到就什么都不改，原始错误继续往上走。
+        await assertNotBouncedOutOfShell(page, '读取推荐列表');
+        throw e;
+      }
     });
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);

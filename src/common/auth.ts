@@ -118,6 +118,36 @@ export function isOutsideBossShellUrl(url: string): boolean {
   }
 }
 
+/** 等被弹出的那次导航落定：轮询上限与间隔。落定通常在几百毫秒内。 */
+const BOUNCE_SETTLE_TIMEOUT_MS = 2_000;
+const BOUNCE_SETTLE_POLL_MS = 150;
+
+/**
+ * 出错后确认是不是「被弹出主壳」，是则抛出带指引的错误；不是则原样返回，让原始错误继续往上走。
+ *
+ * 为什么需要等：被踢出时页面先 `frame got detached`，**弹出的那次导航还没 commit**，
+ * 此刻 `page.url()` 仍是我们刚导航到的 `/web/chat/recommend`。实测这个窗口约 2.6 秒，
+ * 于是只在抛错瞬间读一次 URL 会判成「还在主壳内」，照旧输出「与登录态无关、不要调 boss_login」
+ * ——上一版就是这么漏的（`boss_list_positions` 报对了，因为它的失败点在导航落定之后）。
+ *
+ * 只等 2 秒、且等不到就不改写：不猜。真被弹出时几百毫秒就能看到。
+ */
+export async function assertNotBouncedOutOfShell(page: Page, actionName: string): Promise<void> {
+  const deadline = Date.now() + BOUNCE_SETTLE_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    let url = '';
+    try {
+      url = page.url();
+    } catch {
+      return; // 页面已不可用，交回原始错误，它更能说明情况
+    }
+    if (isOutsideBossShellUrl(url)) {
+      throw new Error(formatLoggedOutMessage(url, actionName));
+    }
+    await sleepRandom(BOUNCE_SETTLE_POLL_MS, BOUNCE_SETTLE_POLL_MS);
+  }
+}
+
 /** 未登录时常见跳转：如 `https://www.zhipin.com/web/user/?ka=bticket` */
 export function isWebUserLoginUrl(url: string): boolean {
   try {
