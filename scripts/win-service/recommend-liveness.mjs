@@ -6,21 +6,30 @@
  *   - `Page.addScriptToEvaluateOnNewDocument timed out`（王理安、杨丽桦，各连续 2 次）
  *   - 卡死一旦发生就持续数十分钟不自愈，只有换标签或重启浏览器才恢复
  *
- * 所以这个脚本做两件事，且**只在没有真实调用在跑的时候**做：
- *   1. 探活：对推荐页发一条最轻的 evaluate（带超时）。这同时起到保活作用——
- *      `chrome://discards` 显示「有 CDP 客户端连着」的标签被标为不可丢弃、不可冻结。
- *   2. 探活失败才恢复：新开标签 → 导航到推荐页 → 关掉僵死的旧标签。
- *      不动 Chrome 进程、不动 profile，登录态零风险（106 和 108 各实测过一次）。
+ * 默认**只探活、只报告，不做任何修复**。探活是对推荐页发一条最轻的 evaluate（带超时），
+ * 不导航、不点击、不刷新——实测连续多轮标签集合完全不变。它同时起到保活作用：
+ * `chrome://discards` 显示「有 CDP 客户端连着」的标签被标为不可丢弃、不可冻结。
  *
- * 恢复是有代价的：换标签意味着推荐列表会重新加载、很可能换一批人，正在等着被打招呼的
- * geekId 会失效。所以**只在确实僵死时才换**——那时列表本来就已经用不了了；
- * 绝不做「预防性刷新」，那才会真的毁掉筛选结果。
+ * 为什么恢复默认关闭（`--recover` 才开）
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 恢复动作是「新开推荐页标签 → 关掉僵死的旧标签」，它有三重代价，其中一条尚未验证：
  *
- * 用法（由计划任务调用，见 run-recommend-liveness.cmd）：
+ *   1. 会重新加载推荐列表，等着被打招呼的 geekId 大概率失效。僵死时列表本来已不可用，
+ *      这条还算可接受。
+ *   2. 新建标签会触发 `boss_page_guards` 的 `targetcreated` 注入——而那正是本项目
+ *      判定的打招呼卡死机制。用一个会引发该故障的动作去修该故障，逻辑上就不成立。
+ *   3. **未验证**：新开的 `/web/chat/recommend` 落在哪个岗位不确定。若它不是「上次选中的
+ *      岗位」而是默认岗位，恢复就等于**静默切换岗位**——而真实流程里岗位由工作流钉住、
+ *      全程不切。静默切岗位会让整批筛选结果对不上，比卡死本身更糟。
+ *
+ * 所以定位改成「早发现 + 如实报告」：卡死在你用到之前就被记进日志，怎么处置由人决定。
+ * 要开恢复必须显式传 `--recover`，并且先把第 3 条验证掉。
+ *
+ * 用法（计划任务只跑第一条）：
  *   node scripts/win-service/recommend-liveness.mjs
- *   node scripts/win-service/recommend-liveness.mjs --probe-only
+ *   node scripts/win-service/recommend-liveness.mjs --recover
  *
- * 退出码：0 健康 / 4 已恢复 / 3 本轮跳过（忙 / 未登录 / 浏览器不可用） / 1 脚本自身出错
+ * 退出码：0 健康 / 4 发现僵死（或已恢复）/ 3 本轮跳过（忙 / 未登录 / 浏览器不可用）/ 1 脚本自身出错
  */
 
 import { appendFile, mkdir, stat } from 'node:fs/promises';
@@ -147,7 +156,8 @@ function looksLoggedOut(url) {
 }
 
 async function main() {
-  const probeOnly = process.argv.includes('--probe-only');
+  // 默认不恢复：见文件头「为什么恢复默认关闭」
+  const allowRecover = process.argv.includes('--recover');
 
   const busy = await serverBusy();
   if (busy.busy) {
@@ -192,14 +202,22 @@ async function main() {
     process.exit(0);
   }
 
-  if (probeOnly) {
-    await log({ action: 'probe', healthy: false, dead: dead.map((d) => ({ url: d.url, reason: d.reason })) });
-    say(`发现 ${dead.length} 个僵死标签，--probe-only 不做恢复`);
+  if (!allowRecover) {
+    await log({
+      action: 'probe',
+      healthy: false,
+      dead: dead.map((d) => ({ url: d.url, reason: d.reason })),
+      note: '默认不恢复：换标签会重载列表、会触发 targetcreated 注入，且新标签落在哪个岗位未验证',
+    });
+    say(`发现 ${dead.length} 个僵死的推荐页标签，已记入日志。未传 --recover，不做任何修复。`);
+    say('处置建议：确认当前岗位后手动新开推荐页标签并关掉僵死的那个，或重启浏览器。');
     process.exit(4);
   }
 
-  // ── 恢复：先建新标签，再关僵死的。顺序很重要——先关可能让 Chrome 只剩零个标签而退出 ──
-  say('开始恢复：新建推荐页标签 → 关闭僵死标签');
+  // ── 恢复（仅 --recover）：先建新标签，再关僵死的。
+  // 顺序很重要——先关可能让 Chrome 只剩零个标签而退出。
+  // 注意这条路径会重载列表、可能改变选中岗位，调用方必须清楚自己在做什么。
+  say('⚠️ --recover 已开：即将新建推荐页标签并关闭僵死标签。列表会重载，选中岗位可能改变。');
   let created = null;
   try {
     created = await cdp(`/json/new?${encodeURIComponent(RECOMMEND_URL)}`, { method: 'PUT' });
