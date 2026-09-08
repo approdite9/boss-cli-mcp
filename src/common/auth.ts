@@ -65,6 +65,33 @@ export function isBossChatShellUrl(url: string): boolean {
   }
 }
 
+/**
+ * 登录态失效时给操作者的统一文案。
+ *
+ * 为什么必须有这么一条：实测登录掉线时，日志里报出来的是四种互不相干的话——
+ * 「等推荐列表就绪超时」、「点了侧栏但页面没跳」、「当前不在推荐列表页」、
+ * 以及最有害的那条「目标页面被导航或刷新…**这与登录态无关，不要调 boss_login**」。
+ * 最后这条在登录真的掉了的时候仍然照说，等于把唯一的解法排除掉；它在审计日志里出现过 4 次。
+ * `isWebUserLoginUrl` 这个判据早就存在，但业务路径一处都没用过。
+ *
+ * `/web/user/?ka=bticket` 里的 `bticket` 就是 Boss 判票失败的落地标记。
+ * 注意：偶发的一次 `bticket` 弹跳重试即可恢复（实测遇到过），**连续多次**才说明票据真的失效了。
+ */
+export function formatLoggedOutMessage(currentUrl: string, actionName?: string): string {
+  return [
+    `❌ Boss 登录态已失效${actionName ? `，无法${actionName}` : ''}：当前页面停在登录页 ${currentUrl || '(unknown)'}。`,
+    '',
+    '这不是前端改版、也不是渲染进程僵死——是登录票据被服务端判为无效',
+    '（`/web/user/?ka=bticket` 中的 bticket 即判票失败标记）。',
+    '',
+    '处理办法：在这台机器的**桌面会话**里执行 `boss login`，用 Boss App 扫码。',
+    'MCP 的 boss_login 工具只能把标签导航到登录页，替不了扫码这一步；',
+    '纯 SSH / 无桌面会话下扫不了码。',
+    '',
+    '注意：偶发一次弹跳到 bticket 重试就能恢复，连续多次才说明票据真的失效了。',
+  ].join('\n');
+}
+
 /** 未登录时常见跳转：如 `https://www.zhipin.com/web/user/?ka=bticket` */
 export function isWebUserLoginUrl(url: string): boolean {
   try {

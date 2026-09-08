@@ -27,10 +27,11 @@ import { readFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { APP_HOME } from '../config.js';
-import { detachBrowserSession } from '../browser/index.js';
+import { detachBrowserSession, getPageRef } from '../browser/index.js';
 import { getPackageMeta } from '../cli/version.js';
 import { runToolCall, textResult, type ToolContext } from './dispatch.js';
 import { formatEnvLoadReport, loadMcpEnv } from './env.js';
+import { setCurrentToolName } from '../common/incident.js';
 import { logAudit } from './mcp_log.js';
 import { resetToolMetrics, takePartialFailures } from './tool_metrics.js';
 import {
@@ -1148,9 +1149,22 @@ export function buildServer(): Server {
     // 分开记的原因：审计里只有一个总时长时，「前面那个调用超时 180s」会被读成
     // 「本次调用自己跑了 364s」，进而误判成单次调用看门狗（240s）失效——现场就误判过一次。
     let execStartedAt = auditStartedAt;
+    // 读当前会话页的 URL，读不到就返回空串。绝不抛错：它只服务于错误文案，
+    // 在错误处理路径上再抛一次会把真正的原因盖掉。
+    const currentSessionPageUrl = (): string => {
+      try {
+        const p = getPageRef();
+        return p && !p.isClosed() ? p.url() : '';
+      } catch {
+        return '';
+      }
+    };
     // 清零上一次调用可能留下的子项失败数。必须在 serialize 之前做：
     // 工具执行是串行的，清零 → 执行中上报 → 落审计时取走，这条路径没有并发歧义。
     resetToolMetrics();
+    // 让故障存档知道是哪个工具触发的：僵死在 boss_page_guards 深处被发现，
+    // 那里没有工具上下文，之前存档里只能写「工具 = (未知)」，而这是排查时第一个要问的。
+    setCurrentToolName(toolName);
     const result = await serialize(() => {
       execStartedAt = Date.now();
       return runToolCall({
@@ -1161,8 +1175,11 @@ export function buildServer(): Server {
         heartbeatMs: HEARTBEAT_INTERVAL_MS,
         resetSession: () => detachBrowserSession(),
         pendingCount: () => queueDepth,
-        // 把共享层那条英文会话锁超时错误改写成可操作指引
-        mapErrorMessage: enhanceToolErrorMessage,
+        // 把共享层那条英文会话锁超时错误改写成可操作指引。
+        // 同时把出错那一刻的页面 URL 交进去：只有它能分开「页面被导航走」与「登录态失效」——
+        // 两者都会让 frame 卸载，只看错误文本会把后者误报成前者，并照旧输出
+        // 「这与登录态无关，不要调 boss_login」，把唯一的解法排除掉（实测发生过 4 次）。
+        mapErrorMessage: (msg) => enhanceToolErrorMessage(msg, currentSessionPageUrl()),
         execute: async (ctx) => {
           configureHeadlessForTool(toolName);
           // 环境变量钉成 false 只管「新 spawn」；`connectBrowser` 的复用分支不看它，

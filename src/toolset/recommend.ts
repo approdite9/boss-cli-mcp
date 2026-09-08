@@ -6,6 +6,7 @@ import {
   sleepRandom,
   humanClick,
 } from '../browser/index.js';
+import { formatLoggedOutMessage, isWebUserLoginUrl } from '../common/auth.js';
 import { withBossSessionPage } from '../common/boss_session_page.js';
 import { ensurePage, isPageAlive } from '../common/ensure_page.js';
 import { rethrowWaitTimeout } from '../common/wait_timeout.js';
@@ -306,7 +307,12 @@ export async function assertRecommendPageReady(
   actionName: string,
 ): Promise<Frame> {
   if (!isBossChatRecommendUrl(page.url())) {
-    throw new Error(`当前不在推荐列表页（/web/chat/recommend），无法${actionName}。`);
+    // 页面被弹到登录页时，「当前不在推荐列表页」这句话虽然没错，却指不到根因，
+    // 而且会让人以为只要导航回去就行——实际上导航回去还会再被弹出来。
+    if (isWebUserLoginUrl(page.url())) {
+      throw new Error(formatLoggedOutMessage(page.url(), actionName));
+    }
+    throw new Error(`当前不在推荐列表页（/web/chat/recommend），无法${actionName}。当前页面：${page.url() || 'unknown'}`);
   }
   // 本函数按契约**不导航**（导航会把当前列表上下文冲掉），所以页面死了只能报错。
   // 但必须在 getRecommendFrame 之前判：否则会先在 waitForSelector 上白等 18 秒，

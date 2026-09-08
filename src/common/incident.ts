@@ -49,6 +49,20 @@ const PROCESS_SAMPLE_GAP_MS = 2_000;
 
 const lastCaptureAt = new Map<IncidentKind, number>();
 
+/**
+ * 当前正在执行的工具名。
+ *
+ * 由 MCP 层在每次调用开始时写入。放在这里而不是 `mcp/tool_metrics.ts`，是为了不让
+ * `common` 反向依赖 `mcp`：这里是唯一的消费者，而 `mcp` 依赖 `common` 是正确方向。
+ * 僵死是在 `boss_page_guards` 深处被发现的，那里拿不到工具上下文，
+ * 之前存档只能写「工具 = (未知)」——而这是排查时第一个要问的问题。
+ */
+let currentToolName = '';
+
+export function setCurrentToolName(name: string): void {
+  currentToolName = name;
+}
+
 function nowStamp(): string {
   const d = new Date();
   const p = (n: number, w = 2): string => String(n).padStart(w, '0');
@@ -248,7 +262,7 @@ export async function captureIncident(
       [
         `时间：${new Date().toISOString()}`,
         `类别：${kind}`,
-        `工具：${options.toolName ?? '(未知)'}`,
+        `工具：${options.toolName || currentToolName || '(未知)'}`,
         `页面：${options.pageUrl ?? '(未知)'}`,
         '',
         '错误信息：',

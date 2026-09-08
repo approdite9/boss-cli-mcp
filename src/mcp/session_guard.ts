@@ -15,6 +15,7 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdirSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
+import { formatLoggedOutMessage, isWebUserLoginUrl } from '../common/auth.js';
 import { CACHE_DIR } from '../config.js';
 
 const INSTANCE_FILE = join(CACHE_DIR, 'mcp-server.pid');
@@ -167,7 +168,7 @@ export function rewriteDetachedFrameMessage(message: string): string | null {
   return [
     '❌ 目标页面在操作过程中被导航或刷新，当前列表上下文已失效，本次调用未完成。',
     '',
-    '这与登录态无关，**不要因此调用 boss_login**——它会把当前标签导航到登录页，',
+    '当前页面不是登录页，所以**不要因此调用 boss_login**——它会把当前标签导航到登录页，',
     '反而让推荐/搜索列表彻底丢失，下一次读取仍会失败。',
     '',
     '推荐列表是易失的：一旦页面被导航走，本轮筛选需要重新开始（重新读取列表，不要沿用旧序号）。',
@@ -176,7 +177,18 @@ export function rewriteDetachedFrameMessage(message: string): string | null {
   ].join('\n');
 }
 
-/** 统一的错误文案增强入口：命中已知模式就改写，否则原样返回 */
-export function enhanceToolErrorMessage(message: string): string {
+/**
+ * 统一的错误文案增强入口：命中已知模式就改写，否则原样返回。
+ *
+ * `currentPageUrl` 由调用方在出错的**那一刻**读出来。有它才能分开两件长得一样的事：
+ * 页面被导航走（列表丢了，别去登录）与登录态失效（唯一的解法就是重新登录）。
+ * 两者都会让 frame 卸载，原先只按错误文本判断，于是登录掉线时照样输出
+ * 「这与登录态无关，不要调 boss_login」——把唯一的解法排除掉了。
+ * 登录判定必须排在最前：它是根因，其它文案都只是它的下游现象。
+ */
+export function enhanceToolErrorMessage(message: string, currentPageUrl?: string): string {
+  if (currentPageUrl && isWebUserLoginUrl(currentPageUrl)) {
+    return `${formatLoggedOutMessage(currentPageUrl)}\n\n（原始信息：${message}）`;
+  }
   return rewriteSessionBusyMessage(message) ?? rewriteDetachedFrameMessage(message) ?? message;
 }
