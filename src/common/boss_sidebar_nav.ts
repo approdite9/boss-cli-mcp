@@ -1,7 +1,7 @@
 import type { Page } from 'puppeteer-core';
 import { SIDEBAR_NAV_AFTER_CLICK_MS, sleepRandom, humanClick } from '../browser/index.js';
 import { randomIntInclusive, sleep } from '../browser/timing.js';
-import { formatLoggedOutMessage, isWebUserLoginUrl } from './auth.js';
+import { formatLoggedOutMessage, isOutsideBossShellUrl } from './auth.js';
 import { rethrowWaitTimeout } from './wait_timeout.js';
 
 const SIDEBAR_NAV_WAIT_MS = 15_000;
@@ -86,9 +86,9 @@ export async function clickBossSidebarMenuToPath(
       { timeout: SIDEBAR_NAV_WAIT_MS },
     )
     .catch((e: unknown) => {
-      // 被弹到登录页时，「点了但没跳」只是现象，根因是票据失效——直接说清楚，
+      // 被弹出主壳时，「点了但没跳」只是现象，根因是票据失效——直接说清楚，
       // 否则下一步会去查菜单选择器和浮层遮挡，方向全错（实测踩过）。
-      if (isWebUserLoginUrl(page.url())) {
+      if (isOutsideBossShellUrl(page.url())) {
         throw new Error(formatLoggedOutMessage(page.url(), `跳转到${targetPath}`));
       }
       return rethrowWaitTimeout(

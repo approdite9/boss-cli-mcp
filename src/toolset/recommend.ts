@@ -6,7 +6,7 @@ import {
   sleepRandom,
   humanClick,
 } from '../browser/index.js';
-import { formatLoggedOutMessage, isWebUserLoginUrl } from '../common/auth.js';
+import { formatLoggedOutMessage, isOutsideBossShellUrl } from '../common/auth.js';
 import { withBossSessionPage } from '../common/boss_session_page.js';
 import { ensurePage, isPageAlive } from '../common/ensure_page.js';
 import { rethrowWaitTimeout } from '../common/wait_timeout.js';
@@ -307,9 +307,11 @@ export async function assertRecommendPageReady(
   actionName: string,
 ): Promise<Frame> {
   if (!isBossChatRecommendUrl(page.url())) {
-    // 页面被弹到登录页时，「当前不在推荐列表页」这句话虽然没错，却指不到根因，
+    // 页面被弹出主壳时，「当前不在推荐列表页」这句话虽然没错，却指不到根因，
     // 而且会让人以为只要导航回去就行——实际上导航回去还会再被弹出来。
-    if (isWebUserLoginUrl(page.url())) {
+    // 判据用「不在 /web/chat/* 主壳」而不是「URL 是登录页」：实测弹出落点常是首页。
+    // 停在 /web/chat/index 这类主壳内页面仍走下面那条原文案，那确实只是位置不对。
+    if (isOutsideBossShellUrl(page.url())) {
       throw new Error(formatLoggedOutMessage(page.url(), actionName));
     }
     throw new Error(`当前不在推荐列表页（/web/chat/recommend），无法${actionName}。当前页面：${page.url() || 'unknown'}`);

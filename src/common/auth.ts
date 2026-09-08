@@ -78,18 +78,44 @@ export function isBossChatShellUrl(url: string): boolean {
  * 注意：偶发的一次 `bticket` 弹跳重试即可恢复（实测遇到过），**连续多次**才说明票据真的失效了。
  */
 export function formatLoggedOutMessage(currentUrl: string, actionName?: string): string {
+  // 两种落点，确定性不同，开头那句必须分开写，不能都断言成「登录页」。
+  // 实测：票据失效时 Boss 更常把 B 端会话弹到**首页** `https://www.zhipin.com/`，
+  // 而不是 `/web/user/?ka=bticket`；只认后者会漏掉主要路径（这一版就是这么漏的）。
+  const onLoginPage = isWebUserLoginUrl(currentUrl);
+  const head = onLoginPage
+    ? `❌ Boss 登录态已失效${actionName ? `，无法${actionName}` : ''}：页面停在登录页 ${currentUrl || '(unknown)'}。`
+    : `❌ 已被弹出 Boss 主壳${actionName ? `，无法${actionName}` : ''}：明确导航到 /web/chat/* 之后，页面被送到了 ${currentUrl || '(unknown)'}。`;
   return [
-    `❌ Boss 登录态已失效${actionName ? `，无法${actionName}` : ''}：当前页面停在登录页 ${currentUrl || '(unknown)'}。`,
+    head,
     '',
-    '这不是前端改版、也不是渲染进程僵死——是登录票据被服务端判为无效',
-    '（`/web/user/?ka=bticket` 中的 bticket 即判票失败标记）。',
+    onLoginPage
+      ? '这不是前端改版、也不是渲染进程僵死——是登录票据被服务端判为无效（`?ka=bticket` 即判票失败标记）。'
+      : '主动进主壳却被踢出来，最可能是登录票据被服务端判为无效（另一种落点是 `/web/user/?ka=bticket`）。',
+    '',
+    '怎么确认：再调一次读列表的工具。**又被弹出**就是票据失效；能正常进去就是一次性抖动。',
     '',
     '处理办法：在这台机器的**桌面会话**里执行 `boss login`，用 Boss App 扫码。',
-    'MCP 的 boss_login 工具只能把标签导航到登录页，替不了扫码这一步；',
-    '纯 SSH / 无桌面会话下扫不了码。',
-    '',
-    '注意：偶发一次弹跳到 bticket 重试就能恢复，连续多次才说明票据真的失效了。',
+    'MCP 的 boss_login 工具只能把标签导航到登录页，替不了扫码这一步；纯 SSH / 无桌面会话下扫不了码。',
   ].join('\n');
+}
+
+/**
+ * 页面是否已经不在 Boss 主壳里（`/web/chat/*` 之外的 zhipin 页面）。
+ *
+ * 用途：区分「页面被导航走」与「会话被服务端踢出」。在我们**刚刚主动导航到 `/web/chat/*`**
+ * 之后仍然落在主壳外，就不是随机的页面漂移，而是被拒绝进入——这是推断，不是猜测。
+ * 首页与 `/web/user/*` 都属于主壳外；`/web/frame/*` 只出现在 iframe 里，不会是顶层页面 URL。
+ */
+export function isOutsideBossShellUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    if (!u.hostname.includes('zhipin.com')) {
+      return false;
+    }
+    return !isBossChatShellUrl(url);
+  } catch {
+    return false;
+  }
 }
 
 /** 未登录时常见跳转：如 `https://www.zhipin.com/web/user/?ka=bticket` */

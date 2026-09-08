@@ -15,7 +15,7 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdirSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
-import { formatLoggedOutMessage, isWebUserLoginUrl } from '../common/auth.js';
+import { formatLoggedOutMessage, isOutsideBossShellUrl } from '../common/auth.js';
 import { CACHE_DIR } from '../config.js';
 
 const INSTANCE_FILE = join(CACHE_DIR, 'mcp-server.pid');
@@ -187,7 +187,10 @@ export function rewriteDetachedFrameMessage(message: string): string | null {
  * 登录判定必须排在最前：它是根因，其它文案都只是它的下游现象。
  */
 export function enhanceToolErrorMessage(message: string, currentPageUrl?: string): string {
-  if (currentPageUrl && isWebUserLoginUrl(currentPageUrl)) {
+  // 判据是「不在 /web/chat/* 主壳里」，不是「URL 等于登录页」：
+  // 实测票据失效时 Boss 更常把 B 端会话弹到首页 https://www.zhipin.com/，
+  // 只认 /web/user/ 会漏掉主要路径。
+  if (currentPageUrl && isOutsideBossShellUrl(currentPageUrl)) {
     return `${formatLoggedOutMessage(currentPageUrl)}\n\n（原始信息：${message}）`;
   }
   return rewriteSessionBusyMessage(message) ?? rewriteDetachedFrameMessage(message) ?? message;
