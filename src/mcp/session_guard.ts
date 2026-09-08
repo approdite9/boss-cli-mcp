@@ -178,6 +178,17 @@ export function rewriteDetachedFrameMessage(message: string): string | null {
 }
 
 /**
+ * 消息里是否已经带了「被弹出主壳 / 登录态失效」的结论。
+ *
+ * 判据用文案里的固定开头，与 `formatLoggedOutMessage` 一一对应；改那边的开头要同步改这里。
+ * 之所以按文本判：内层抛出的错误会被上层包成「读取推荐列表失败：…」，
+ * 到这里已经没有结构化标记可用，而重复六行文案比这点耦合更糟。
+ */
+function isBouncedOutMessage(message: string): boolean {
+  return message.includes('已被弹出 Boss 主壳') || message.includes('Boss 登录态已失效');
+}
+
+/**
  * 统一的错误文案增强入口：命中已知模式就改写，否则原样返回。
  *
  * `currentPageUrl` 由调用方在出错的**那一刻**读出来。有它才能分开两件长得一样的事：
@@ -191,6 +202,11 @@ export function enhanceToolErrorMessage(message: string, currentPageUrl?: string
   // 实测票据失效时 Boss 更常把 B 端会话弹到首页 https://www.zhipin.com/，
   // 只认 /web/user/ 会漏掉主要路径。
   if (currentPageUrl && isOutsideBossShellUrl(currentPageUrl)) {
+    // 内层已经报过同一件事（如 runRecommend 里的 assertNotBouncedOutOfShell）时不要再包一层，
+    // 否则同一段六行文案会出现两遍：一遍作为正文、一遍塞进「原始信息」里。
+    if (isBouncedOutMessage(message)) {
+      return message;
+    }
     return `${formatLoggedOutMessage(currentPageUrl)}\n\n（原始信息：${message}）`;
   }
   return rewriteSessionBusyMessage(message) ?? rewriteDetachedFrameMessage(message) ?? message;
