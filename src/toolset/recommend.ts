@@ -8,6 +8,7 @@ import {
 } from '../browser/index.js';
 import { withBossSessionPage } from '../common/boss_session_page.js';
 import { ensurePage, isPageAlive } from '../common/ensure_page.js';
+import { rethrowWaitTimeout } from '../common/wait_timeout.js';
 
 const BOSS_CHAT_RECOMMEND_URL = 'https://www.zhipin.com/web/chat/recommend';
 
@@ -111,9 +112,20 @@ export function isBossChatRecommendUrl(url: string): boolean {
 
 async function getRecommendFrame(page: Page): Promise<Frame> {
   const timeoutMs = 18_000;
-  const iframe = await page.waitForSelector('iframe[name="recommendFrame"]', {
-    timeout: timeoutMs,
-  });
+  // 这一句超时原本报的是裸的 `Waiting failed: 18000ms exceeded`：不说等的是哪个选择器、
+  // 也不说页面在哪。更糟的是下面 ensureRecommendFrameReady 的等待也是 18000ms，
+  // 两条完全不同的故障（主文档没有推荐 iframe / iframe 有了但列表没挂载）报出同一句话。
+  const iframe = await page
+    .waitForSelector('iframe[name="recommendFrame"]', { timeout: timeoutMs })
+    .catch((e: unknown) =>
+      rethrowWaitTimeout(
+        e,
+        `等推荐 iframe 超时：主文档在 ${timeoutMs}ms 内没有出现 iframe[name="recommendFrame"]。` +
+          `当前页面：${page.url() || 'unknown'}；` +
+          `已有 frame：${page.frames().map((f) => f.url() || '(about:blank)').join('｜') || '（无）'}。` +
+          `常见原因是页面并不在推荐页、或主文档尚未渲染完；这一步不做导航，请先确认页面位置。`,
+      ),
+    );
   if (!iframe) {
     throw new Error('未找到推荐 iframe（iframe[name="recommendFrame"]）。');
   }
@@ -137,16 +149,28 @@ async function getRecommendFrame(page: Page): Promise<Frame> {
 }
 
 async function ensureRecommendFrameReady(frame: Frame): Promise<void> {
-  await frame.waitForFunction(
-    `(() => {
+  const timeoutMs = 18_000;
+  await frame
+    .waitForFunction(
+      `(() => {
       const sel = ${JSON.stringify(RECOMMEND_CARD_ANCHOR_SELECTOR)};
       if (document.querySelector(sel)) return true;
       // 列表容器已挂载但一个候选人都没有，也算就绪（空列表是正常状态，不该等到超时）。
       const root = document.querySelector(".card-list, .geek-list-wrap .geek-list");
       return !!root;
     })()`,
-    { timeout: 18_000 },
-  );
+      { timeout: timeoutMs },
+    )
+    .catch((e: unknown) =>
+      rethrowWaitTimeout(
+        e,
+        `等推荐列表就绪超时：iframe 已经在了，但 ${timeoutMs}ms 内既没出现候选人锚点` +
+          `（${RECOMMEND_CARD_ANCHOR_SELECTOR}）也没出现列表容器（.card-list / .geek-list-wrap .geek-list）。` +
+          `iframe 地址：${frame.url() || 'unknown'}。` +
+          `这与「主文档里找不到推荐 iframe」是两回事：iframe 在、内容没出来，` +
+          `要么 Boss 改了列表 DOM，要么该 iframe 的渲染进程已经不干活了。`,
+      ),
+    );
 }
 
 async function readCurrentRecommendJobLabel(frame: Frame): Promise<string> {
